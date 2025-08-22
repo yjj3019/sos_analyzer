@@ -490,8 +490,9 @@ class AIAnalyzer:
 
             if is_news_request:
                 llm_log_path = self.output_dir / "llm_security_news.log"
-                with open(llm_log_path, 'w', encoding='utf-8') as f:
-                    f.write("--- PROMPT FOR SECURITY NEWS ---\n")
+                # 'a' (append) mode to keep logs from multiple calls
+                with open(llm_log_path, 'a', encoding='utf-8') as f:
+                    f.write("\n\n--- NEW PROMPT FOR SECURITY NEWS ---\n")
                     f.write(prompt)
                     f.write("\n\n--- LLM RESPONSE ---\n")
                 print("\n--- LLM에게 보낸 보안 뉴스 프롬프트 ---")
@@ -572,6 +573,15 @@ class AIAnalyzer:
         if not ai_response or not ai_response.strip():
             raise ValueError("AI 응답이 비어 있습니다.")
 
+        # LLM의 거절 메시지 패턴 확인
+        refusal_patterns = [
+            "i'm sorry", "i cannot", "i can't", "i am unable", 
+            "죄송합니다", "할 수 없습니다"
+        ]
+        # 응답을 소문자로 변환하여 패턴 검사
+        if any(pattern in ai_response.lower() for pattern in refusal_patterns):
+            raise ValueError(f"LLM이 요청 처리를 거부했습니다. (응답: '{ai_response.strip()}')")
+
         try:
             # 마크다운 코드 블록과 앞뒤 공백을 제거
             cleaned_response = re.sub(r'^```(json)?\s*|\s*```$', '', ai_response.strip())
@@ -590,6 +600,7 @@ class AIAnalyzer:
             print(error_message)
             raise ValueError(error_message)
         except ValueError as e:
+            # 여기서 발생하는 ValueError는 JSON 객체 못찾는 경우 포함
             error_message = f"AI 응답 처리 중 오류 발생: {e}.\n--- 원본 응답 ---\n{ai_response}\n----------------"
             print(error_message)
             raise ValueError(error_message)
@@ -597,7 +608,6 @@ class AIAnalyzer:
     def fetch_security_news(self) -> List[Dict[str, str]]:
         """RHEL 관련 최신 보안 뉴스를 가져옵니다."""
         print("최신 RHEL 보안 뉴스 조회 중 (Red Hat API 직접 호출)...")
-        security_news = []
         try:
             # 1. Red Hat의 공식 CVE 데이터 API를 직접 호출
             api_url = "https://access.redhat.com/hydra/rest/securitydata/cve.json"
@@ -610,44 +620,128 @@ class AIAnalyzer:
             all_cves = response.json()
             print(f"총 {len(all_cves)}개의 CVE 데이터를 가져왔습니다.")
             
-            # 2. Python으로 데이터 필터링
-            start_date_str = (datetime.now() - timedelta(days=180)).strftime('%Y-%m-%d')
+            # 2. 데이터 필터링 (미래 CVE 제외, 최근 180일, Critical/Important 등급)
+            now = datetime.now()
+            start_date = now - timedelta(days=180)
             
-            cves_after_date_filter = [cve for cve in all_cves if cve.get('public_date', '') >= start_date_str]
-            print(f"날짜 필터링 후: {len(cves_after_date_filter)}개 CVE")
-
-            cves_after_severity_filter = [cve for cve in cves_after_date_filter if isinstance(cve.get('severity'), str) and cve.get('severity').lower() in ["critical", "important"]]
-            print(f"심각도 필터링 후: {len(cves_after_severity_filter)}개 CVE")
-            
-            # 4. 선택된 CVE에 대해 LLM으로 동향 분석
-            for cve_data in cves_after_severity_filter:
+            filtered_cves = []
+            for cve in all_cves:
+                public_date_str = cve.get('public_date')
+                if not public_date_str:
+                    continue
+                
                 try:
-                    trends_prompt = f"""다음 CVE에 대한 국내외 동향을 웹 검색을 활성화하여 요약하고, JSON 형식으로 제공해줘. 기술적 설명보다는 이 취약점이 어떻게 논의되고 있는지, 주요 기업들의 반응, 패치 현황 등을 중심으로 간략하게 설명해줘.
-                    CVE: {cve_data['CVE']}
+                    cve_date = datetime.fromisoformat(public_date_str.replace('Z', '+00:00')).replace(tzinfo=None)
+                except ValueError:
+                    print(f"경고: 잘못된 날짜 형식으로 CVE를 건너뜁니다: {cve.get('CVE')}, {public_date_str}")
+                    continue
 
-                    응답은 반드시 다음 JSON 형식이어야 해:
-                    ```json
-                    {{
-                      "summary": "여기에 국내외 동향 요약 내용을 작성"
-                    }}
-                    ```
-                    다른 설명 없이 순수한 JSON 객체만 출력해야 합니다.
-                    """
-                    
-                    trends_analysis_result = self.perform_ai_analysis(trends_prompt, is_news_request=True)
-                    trends_summary = "동향 정보를 요약하는 데 실패했습니다."
-                    if isinstance(trends_analysis_result, dict):
-                        trends_summary = trends_analysis_result.get("summary", trends_summary)
+                if (cve_date <= now and 
+                    cve_date >= start_date and 
+                    isinstance(cve.get('severity'), str) and 
+                    cve.get('severity').lower() in ["critical", "important"]):
+                    filtered_cves.append(cve)
 
-                    cve_data['trends'] = trends_summary
-                    security_news.append(cve_data)
-                    print(f"✅ 보안 뉴스 추가: {cve_data['CVE']} ({cve_data['severity']})")
+            print(f"필터링 후: {len(filtered_cves)}개 CVE")
 
-                except Exception as e:
-                    print(f"⚠️ {cve_data['CVE']} 동향 분석 중 오류 발생: {e}")
+            if not filtered_cves:
+                print("분석할 최신 보안 뉴스가 없습니다.")
+                return []
+            
+            # 3. [1단계 AI 분석] 가장 중요한 CVE 5개 선정
+            cve_identifiers = [cve['CVE'] for cve in filtered_cves]
+            selection_prompt = f"""당신은 Red Hat Enterprise Linux (RHEL) 취약점 분석 전문가입니다. 
+            분석은 "Web Search"를 활성하여 국내/해외 보안 사이트의 Linux 관련 보안 취약점 이슈를 검색하여 Red Hat 공식 자료(Red Hat Security Advisories, Red Hat CVE 데이터베이스 등)에 기반하여 조사하고, RHEL 이외의 리눅스 배포본(Ubuntu, Debian 등)은 제외합니다.
+            최근 3개월 동안의 Red Hat CVE 데이터와 비교해 중요도(Important/Critical)인 취약점 중, "kernel, glibc, openssl, openssh, systemd" 관련 항목을 우선으로 총 5개를 랜덤으로 선별.
+            선별된 취약점은 Red Hat 사이트 및 신뢰할 수 있는 보안 사이트(cve.mitre.org, nvd.nist.gov)를 통해 RHEL 맥락에서 요약. 요약은 기술적 세부사항 대신 보안 커뮤니티 논의, 주요 기업 반응, 패치 현황 중심으로 간략히 작성.
 
-            print("✅ 보안 뉴스 조회 완료.")
-            return security_news
+CVE 목록: {', '.join(cve_identifiers)}
+응답은 반드시 다음 JSON 형식이어야 해. 가장 중요한 5개의 CVE에 대한 분석만 객체로 포함해야 해.
+```json
+{{
+  "cve_trends": [
+    {{
+      "cve_id": "CVE-XXXX-XXXX",
+      "component": "kernel",
+      "summary": "설명 최소화 (논의, 반응, 패치 현황 중심)",
+      "red_hat_advisory": "RHSA-XXXX:XXXX 또는 해당 링크"
+    }}
+  ]
+}}
+```
+다른 설명 없이 순수한 JSON 객체만 출력해야 합니다."""
+            
+            selection_result = self.perform_ai_analysis(selection_prompt, is_news_request=True)
+            
+            if not (isinstance(selection_result, dict) and 'cve_trends' in selection_result and selection_result['cve_trends']):
+                print("⚠️ LLM이 중요 CVE를 선정하지 못했습니다.")
+                return []
+
+            trends_map = {item['cve_id']: item['summary'] for item in selection_result['cve_trends']}
+            selected_cve_ids = trends_map.keys()
+
+            # 원본 데이터에서 선택된 CVE 정보만 추출
+            top_cves_data = [cve for cve in filtered_cves if cve['CVE'] in selected_cve_ids]
+
+            # 4. [2단계 AI 분석] 요약 번역 및 동향 재요약
+            processing_data = []
+            for cve in top_cves_data:
+                processing_data.append({
+                    "cve_id": cve['CVE'],
+                    "description": cve.get('bugzilla_description', '요약 정보 없음'),
+                    "trend": trends_map.get(cve['CVE'], '')
+                })
+
+            processing_prompt = f"""다음 JSON 데이터에 포함된 각 CVE에 대해, 'description'을 한국어로 번역하고 'trend'를 한 문장으로 더 간결하게 요약해줘.
+입력 데이터:
+```json
+{json.dumps(processing_data, indent=2, ensure_ascii=False)}
+```
+응답은 반드시 다음 JSON 형식이어야 해:
+```json
+{{
+  "processed_cves": [
+    {{
+      "cve_id": "CVE-XXXX-XXXX",
+      "translated_description": "한국어로 번역된 요약",
+      "concise_trend": "한 문장으로 요약된 동향"
+    }}
+  ]
+}}
+```
+다른 설명 없이 순수한 JSON 객체만 출력해야 합니다."""
+
+            processed_result = self.perform_ai_analysis(processing_prompt, is_news_request=True)
+
+            # 5. 최종 데이터 조합
+            final_cves = []
+            if isinstance(processed_result, dict) and 'processed_cves' in processed_result:
+                processed_map = {item['cve_id']: item for item in processed_result['processed_cves']}
+                for cve_data in top_cves_data:
+                    cve_id = cve_data['CVE']
+                    if cve_id in processed_map:
+                        processed_info = processed_map[cve_id]
+                        # 날짜 형식 변경
+                        cve_date_str = cve_data.get('public_date', '')
+                        if cve_date_str:
+                            try:
+                                # 이미 YY/MM/DD 형식일 수 있으므로 예외 처리
+                                datetime.strptime(cve_date_str, '%y/%m/%d')
+                            except ValueError:
+                                cve_data['public_date'] = datetime.fromisoformat(cve_date_str.replace('Z', '+00:00')).strftime('%y/%m/%d')
+                        
+                        # 번역 및 요약된 내용으로 업데이트
+                        cve_data['bugzilla_description'] = processed_info.get('translated_description', cve_data['bugzilla_description'])
+                        cve_data['trends'] = processed_info.get('concise_trend', trends_map.get(cve_id, ''))
+                        
+                        final_cves.append(cve_data)
+                        print(f"✅ 보안 뉴스 처리 완료: {cve_id}")
+            else:
+                print("⚠️ LLM의 번역/요약 처리에 실패했습니다. 원본 데이터로 보고서를 생성합니다.")
+                return top_cves_data # 실패 시, 번역/재요약 없이 1단계 결과라도 반환
+
+            print("✅ 보안 뉴스 조회 및 처리 완료.")
+            return final_cves
 
         except Exception as e:
             print(f"❌ 보안 뉴스 조회 중 심각한 오류 발생: {e}")
@@ -790,7 +884,12 @@ class AIAnalyzer:
             for item in data_list:
                 rows += "<tr>"
                 for header in headers:
-                    rows += f"<td>{html.escape(str(item.get(header, 'N/A')))}</td>"
+                    # CVE-ID를 링크로 만들기
+                    if header == 'CVE' and isinstance(item.get(header), str):
+                        cve_id = html.escape(item.get(header))
+                        rows += f'<td><a href="https://access.redhat.com/security/cve/{cve_id}" target="_blank">{cve_id}</a></td>'
+                    else:
+                        rows += f"<td>{html.escape(str(item.get(header, 'N/A')))}</td>"
                 rows += "</tr>"
             return rows
 
@@ -948,10 +1047,10 @@ class AIAnalyzer:
                 <ul class="issue-list critical-list">{''.join(f"<li>{html.escape(service)}</li>" for service in failed_services) or "<li>실패한 서비스가 없습니다.</li>"}</ul>
             </div>
             <div class="section">
-                <h2>🛡️ 보안 뉴스</h2>
+                <h2>🛡️ 보안 뉴스 (가장 중요한 5개)</h2>
                 <table class="data-table">
                     <thead><tr><th>CVE 식별자</th><th>심각도</th><th>생성일</th><th>요약</th><th>국내외 동향</th></tr></thead>
-                    <tbody>{create_table_rows(security_news, ['cve_id', 'severity', 'public_date', 'summary', 'trends'], "보안 뉴스 정보를 가져오지 못했습니다.")}</tbody>
+                    <tbody>{create_table_rows(security_news, ['CVE', 'severity', 'public_date', 'bugzilla_description', 'trends'], "보안 뉴스 정보를 가져오지 못했습니다.")}</tbody>
                 </table>
                 <p style="font-size: 12px; text-align: center;">보안 정보에 대한 상세 내용은 <a href="https://access.redhat.com/security/security-updates/security-advisories" target="_blank">Red Hat Security Advisories</a> 사이트에서 확인하실 수 있습니다.</p>
             </div>
