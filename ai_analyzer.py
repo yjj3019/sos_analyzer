@@ -596,76 +596,77 @@ class AIAnalyzer:
 
     def fetch_security_news(self) -> List[Dict[str, str]]:
         """RHEL 관련 최신 보안 뉴스를 가져옵니다."""
-        print("최신 RHEL 보안 뉴스 조회 중 (웹 검색 활성화)...")
+        print("최신 RHEL 보안 뉴스 조회 중 (Red Hat API 직접 호출)...")
+        security_news = []
         try:
-            # 1. LLM을 통해 최신 CVE 목록 검색
-            cve_search_prompt = "웹 검색을 활성화하여, 최근 6개월 내에 발표된 Red Hat Enterprise Linux(RHEL) 관련 주요 보안 취약점(CVE) 10개에 대해, 각각의 CVE 식별자와 간단한 한 줄 설명을 포함하여 목록을 만들어줘. 예: CVE-2023-1234 - 커널의 메모리 누수 취약점."
-            
-            cve_payload = {
-                "model": self.model_name,
-                "messages": [{"role": "user", "content": cve_search_prompt}],
-                "max_tokens": 1024, "temperature": 0
-            }
-            response = self.session.post(self.completion_url, json=cve_payload, timeout=60)
+            # 1. Red Hat의 공식 CVE 데이터 API를 직접 호출
+            api_url = "https://access.redhat.com/hydra/rest/securitydata/cve.json"
+            print(f"Red Hat CVE API 호출: {api_url}")
+            response = requests.get(api_url, timeout=120)
             if response.status_code != 200:
-                print("⚠️ LLM을 통한 CVE 검색 실패, 보안 뉴스 조회를 건너뜁니다.")
-                return []
-            
-            cve_response_json = response.json()
-            cve_text = cve_response_json.get('choices', [{}])[0].get('message', {}).get('content')
-            
-            if not isinstance(cve_text, str):
-                print(f"⚠️ LLM 응답에서 유효한 CVE 텍스트를 받지 못했습니다. 받은 내용: {cve_text}")
+                print(f"⚠️ Red Hat CVE API 조회 실패 (HTTP {response.status_code}), 보안 뉴스 조회를 건너뜁니다.")
                 return []
 
-            cve_ids = re.findall(r'CVE-\d{4}-\d{4,7}', cve_text)
-            if not cve_ids:
-                print("⚠️ LLM 응답에서 CVE ID를 찾지 못했습니다.")
-                return []
-
-            print(f"발견된 CVE 후보: {cve_ids}")
+            all_cves = response.json()
             
-            # 2. Red Hat API로 CVE 정보 조회 및 필터링
-            security_news = []
-            for cve_id in cve_ids:
-                if len(security_news) >= 5: break
+            # 2. Python으로 데이터 필터링
+            start_date_str = (datetime.now() - timedelta(days=180)).strftime('%Y-%m-%d')
+            
+            filtered_cves = []
+            for cve in all_cves:
+                # `product_name` 필드 처리 (문자열 또는 리스트)
+                product_info = cve.get('product_name')
+                is_rhel_related = False
+                if isinstance(product_info, str):
+                    if "Red Hat Enterprise Linux" in product_info:
+                        is_rhel_related = True
+                elif isinstance(product_info, list):
+                    for product in product_info:
+                        if isinstance(product, str) and "Red Hat Enterprise Linux" in product:
+                            is_rhel_related = True
+                            break
                 
+                if (is_rhel_related and
+                    cve.get('public_date', '') >= start_date_str and
+                    cve.get('severity') in ["Critical", "Important"]):
+                    filtered_cves.append({
+                        'cve_id': cve.get('cve_id'),
+                        'severity': cve.get('severity'),
+                        'public_date': cve.get('public_date', '').split('T')[0],
+                        'summary': cve.get('summary', '요약 정보 없음')
+                    })
+
+            # 3. 최신순으로 정렬하여 상위 5개 선택
+            sorted_cves = sorted(filtered_cves, key=lambda x: x['public_date'], reverse=True)[:5]
+            print(f"필터링 및 선택된 CVE: {[c['cve_id'] for c in sorted_cves]}")
+
+            # 4. 선택된 CVE에 대해 LLM으로 동향 분석
+            for cve_data in sorted_cves:
                 try:
-                    rh_api_url = f"https://access.redhat.com/hydra/rest/securitydata/cve/{cve_id}.json"
-                    rh_response = requests.get(rh_api_url, timeout=20)
-                    if rh_response.status_code == 200:
-                        cve_data = rh_response.json()
-                        severity = cve_data.get('threat_severity')
-                        if severity in ["Critical", "Important"]:
-                            details = cve_data.get('details', [''])[0]
-                            trends_prompt = f"""다음 CVE에 대한 국내외 동향을 웹 검색을 활성화하여 요약하고, JSON 형식으로 제공해줘. 기술적 설명보다는 이 취약점이 어떻게 논의되고 있는지, 주요 기업들의 반응, 패치 현황 등을 중심으로 간략하게 설명해줘.
-                            CVE: {cve_id}
-                            요약: {details}
+                    trends_prompt = f"""다음 CVE에 대한 국내외 동향을 웹 검색을 활성화하여 요약하고, JSON 형식으로 제공해줘. 기술적 설명보다는 이 취약점이 어떻게 논의되고 있는지, 주요 기업들의 반응, 패치 현황 등을 중심으로 간략하게 설명해줘.
+                    CVE: {cve_data['cve_id']}
+                    요약: {cve_data['summary']}
 
-                            응답은 반드시 다음 JSON 형식이어야 해:
-                            ```json
-                            {{
-                              "summary": "여기에 국내외 동향 요약 내용을 작성"
-                            }}
-                            ```
-                            다른 설명 없이 순수한 JSON 객체만 출력해야 합니다.
-                            """
-                            
-                            trends_analysis_result = self.perform_ai_analysis(trends_prompt, is_news_request=True)
-                            trends_summary = "동향 정보를 요약하는 데 실패했습니다."
-                            if isinstance(trends_analysis_result, dict):
-                                trends_summary = trends_analysis_result.get("summary", trends_summary)
+                    응답은 반드시 다음 JSON 형식이어야 해:
+                    ```json
+                    {{
+                      "summary": "여기에 국내외 동향 요약 내용을 작성"
+                    }}
+                    ```
+                    다른 설명 없이 순수한 JSON 객체만 출력해야 합니다.
+                    """
+                    
+                    trends_analysis_result = self.perform_ai_analysis(trends_prompt, is_news_request=True)
+                    trends_summary = "동향 정보를 요약하는 데 실패했습니다."
+                    if isinstance(trends_analysis_result, dict):
+                        trends_summary = trends_analysis_result.get("summary", trends_summary)
 
-                            security_news.append({
-                                "cve_id": cve_id,
-                                "severity": severity,
-                                "public_date": cve_data.get('public_date', 'N/A').split('T')[0],
-                                "summary": details,
-                                "trends": trends_summary
-                            })
-                            print(f"✅ 보안 뉴스 추가: {cve_id} ({severity})")
+                    cve_data['trends'] = trends_summary
+                    security_news.append(cve_data)
+                    print(f"✅ 보안 뉴스 추가: {cve_data['cve_id']} ({cve_data['severity']})")
+
                 except Exception as e:
-                    print(f"⚠️ {cve_id} 처리 중 오류 발생: {e}")
+                    print(f"⚠️ {cve_data['cve_id']} 동향 분석 중 오류 발생: {e}")
 
             print("✅ 보안 뉴스 조회 완료.")
             return security_news
