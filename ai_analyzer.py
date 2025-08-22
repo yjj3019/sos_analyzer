@@ -608,44 +608,22 @@ class AIAnalyzer:
                 return []
 
             all_cves = response.json()
+            print(f"총 {len(all_cves)}개의 CVE 데이터를 가져왔습니다.")
             
             # 2. Python으로 데이터 필터링
             start_date_str = (datetime.now() - timedelta(days=180)).strftime('%Y-%m-%d')
             
-            filtered_cves = []
-            for cve in all_cves:
-                # `product_name` 필드 처리 (문자열 또는 리스트)
-                product_info = cve.get('product_name')
-                is_rhel_related = False
-                if isinstance(product_info, str):
-                    if "Red Hat Enterprise Linux" in product_info:
-                        is_rhel_related = True
-                elif isinstance(product_info, list):
-                    for product in product_info:
-                        if isinstance(product, str) and "Red Hat Enterprise Linux" in product:
-                            is_rhel_related = True
-                            break
-                
-                if (is_rhel_related and
-                    cve.get('public_date', '') >= start_date_str and
-                    cve.get('severity') in ["Critical", "Important"]):
-                    filtered_cves.append({
-                        'cve_id': cve.get('cve_id'),
-                        'severity': cve.get('severity'),
-                        'public_date': cve.get('public_date', '').split('T')[0],
-                        'summary': cve.get('summary', '요약 정보 없음')
-                    })
+            cves_after_date_filter = [cve for cve in all_cves if cve.get('public_date', '') >= start_date_str]
+            print(f"날짜 필터링 후: {len(cves_after_date_filter)}개 CVE")
 
-            # 3. 최신순으로 정렬하여 상위 5개 선택
-            sorted_cves = sorted(filtered_cves, key=lambda x: x['public_date'], reverse=True)[:5]
-            print(f"필터링 및 선택된 CVE: {[c['cve_id'] for c in sorted_cves]}")
-
+            cves_after_severity_filter = [cve for cve in cves_after_date_filter if isinstance(cve.get('severity'), str) and cve.get('severity').lower() in ["critical", "important"]]
+            print(f"심각도 필터링 후: {len(cves_after_severity_filter)}개 CVE")
+            
             # 4. 선택된 CVE에 대해 LLM으로 동향 분석
-            for cve_data in sorted_cves:
+            for cve_data in cves_after_severity_filter:
                 try:
                     trends_prompt = f"""다음 CVE에 대한 국내외 동향을 웹 검색을 활성화하여 요약하고, JSON 형식으로 제공해줘. 기술적 설명보다는 이 취약점이 어떻게 논의되고 있는지, 주요 기업들의 반응, 패치 현황 등을 중심으로 간략하게 설명해줘.
-                    CVE: {cve_data['cve_id']}
-                    요약: {cve_data['summary']}
+                    CVE: {cve_data['CVE']}
 
                     응답은 반드시 다음 JSON 형식이어야 해:
                     ```json
@@ -663,10 +641,10 @@ class AIAnalyzer:
 
                     cve_data['trends'] = trends_summary
                     security_news.append(cve_data)
-                    print(f"✅ 보안 뉴스 추가: {cve_data['cve_id']} ({cve_data['severity']})")
+                    print(f"✅ 보안 뉴스 추가: {cve_data['CVE']} ({cve_data['severity']})")
 
                 except Exception as e:
-                    print(f"⚠️ {cve_data['cve_id']} 동향 분석 중 오류 발생: {e}")
+                    print(f"⚠️ {cve_data['CVE']} 동향 분석 중 오류 발생: {e}")
 
             print("✅ 보안 뉴스 조회 완료.")
             return security_news
