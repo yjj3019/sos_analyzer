@@ -650,10 +650,28 @@ class AIAnalyzer:
             
             # 3. [1단계 AI 분석] 가장 중요한 CVE 5개 선정
             cve_identifiers = [cve['CVE'] for cve in filtered_cves]
-            selection_prompt = f"""당신은 Red Hat Enterprise Linux (RHEL) 취약점 분석 전문가입니다. 
-            분석은 "Web Search"를 활성하여 국내/해외 보안 사이트의 Linux 관련 보안 취약점 이슈를 검색하여 Red Hat 공식 자료(Red Hat Security Advisories, Red Hat CVE 데이터베이스 등)에 기반하여 조사하고, RHEL 이외의 리눅스 배포본(Ubuntu, Debian 등)은 제외합니다.
-            최근 3개월 동안의 Red Hat CVE 데이터와 비교해 중요도(Important/Critical)인 취약점 중, "kernel, glibc, openssl, openssh, systemd" 관련 항목을 우선으로 총 5개를 랜덤으로 선별.
-            선별된 취약점은 Red Hat 사이트 및 신뢰할 수 있는 보안 사이트(cve.mitre.org, nvd.nist.gov)를 통해 RHEL 맥락에서 요약. 요약은 기술적 세부사항 대신 보안 커뮤니티 논의, 주요 기업 반응, 패치 현황 중심으로 간략히 작성.
+            selection_prompt = f"""[시스템 안내]  
+당신은 보안 전문가이자 리눅스 엔지니어입니다.  
+다음 조건에 맞춰 최근 6개월 내 전 세계적으로 이슈된 보안 취약점 중 Red Hat Enterprise Linux(RHEL) 관련 내용을 조사하고 요약하세요.  
+
+[조사 및 선별 조건]  
+1. 출처는 반드시 Red Hat 공식 보안 자료(예: Red Hat Security Advisories, Red Hat CVE 데이터베이스) 기반으로 하며, RHEL 외 다른 리눅스 배포판(Ubuntu, Debian 등)은 제외합니다.  
+2. 중요도는 Important 또는 Critical 등급의 취약점에 한정합니다.  
+3. 우선순위는 "kernel, glibc, openssl, openssh, systemd" 관련 취약점으로 하며, 이 중 5개를 무작위로 선별합니다.  
+4. 선별된 취약점은 Red Hat 공식 사이트 및 신뢰할 수 있는 보안 사이트(cve.mitre.org, nvd.nist.gov)에서 검증 후, RHEL 환경에서의 영향과 대응 현황을 중심으로 간략히 요약합니다.  
+   - 기술적 세부사항보다는 보안 커뮤니티 논의, 주요 기업 반응, 패치 상태 위주로 작성합니다.  
+5. 필요시 "Web Search" 기능을 활성화하여 최신 정보와 추가 의견을 확보하세요.  
+
+[출력 형식 예시]  
+- CVE 번호 및 취약점명  
+- 영향받는 컴포넌트 및 RHEL 버전  
+- 취약점 중요도  
+- 보안 커뮤니티 및 기업 반응 요약  
+- 현재 패치 및 대응 현황  
+
+현재 날짜: 준수
+
+위 조건을 엄격히 준수하여 조사 및 요약을 시작하세요.
 
 CVE 목록: {', '.join(cve_identifiers)}
 응답은 반드시 다음 JSON 형식이어야 해. 가장 중요한 5개의 CVE에 대한 분석만 객체로 포함해야 해.
@@ -1046,16 +1064,8 @@ CVE 목록: {', '.join(cve_identifiers)}
                 <h2>🔧 실패한 서비스</h2>
                 <ul class="issue-list critical-list">{''.join(f"<li>{html.escape(service)}</li>" for service in failed_services) or "<li>실패한 서비스가 없습니다.</li>"}</ul>
             </div>
-            <div class="section">
-                <h2>🛡️ 보안 뉴스 (가장 중요한 5개)</h2>
-                <table class="data-table">
-                    <thead><tr><th>CVE 식별자</th><th>심각도</th><th>생성일</th><th>요약</th><th>국내외 동향</th></tr></thead>
-                    <tbody>{create_table_rows(security_news, ['CVE', 'severity', 'public_date', 'bugzilla_description', 'trends'], "보안 뉴스 정보를 가져오지 못했습니다.")}</tbody>
-                </table>
-                <p style="font-size: 12px; text-align: center;">보안 정보에 대한 상세 내용은 <a href="https://access.redhat.com/security/security-updates/security-advisories" target="_blank">Red Hat Security Advisories</a> 사이트에서 확인하실 수 있습니다.</p>
-            </div>
 
-            <!-- AI 분석 섹션을 보고서 하단으로 이동 -->
+            <!-- AI 분석 섹션 -->
             <div class="section">
                 <h2>🚨 AI 분석: 심각한 이슈 ({len(critical_issues)}개)</h2>
                 <ul class="issue-list critical-list">{''.join(f"<li>{html.escape(issue)}</li>" for issue in critical_issues) or "<li>발견된 심각한 이슈가 없습니다.</li>"}</ul>
@@ -1077,6 +1087,16 @@ CVE 목록: {', '.join(cve_identifiers)}
                     <p><b>종합 상태:</b> <span class="ai-status">{status}</span> (건강도 점수: {score}/100)</p>
                     <p><b>요약:</b> {summary}</p>
                 </div>
+            </div>
+
+            <!-- 보안 뉴스 섹션 (AI 분석 섹션 뒤로 이동) -->
+            <div class="section">
+                <h2>🛡️ 보안 뉴스 (가장 중요한 5개)</h2>
+                <table class="data-table">
+                    <thead><tr><th>CVE 식별자</th><th>심각도</th><th>생성일</th><th>요약</th><th>국내외 동향</th></tr></thead>
+                    <tbody>{create_table_rows(security_news, ['CVE', 'severity', 'public_date', 'bugzilla_description', 'trends'], "보안 뉴스 정보를 가져오지 못했습니다.")}</tbody>
+                </table>
+                <p style="font-size: 12px; text-align: center;">보안 정보에 대한 상세 내용은 <a href="https://access.redhat.com/security/security-updates/security-advisories" target="_blank">Red Hat Security Advisories</a> 사이트에서 확인하실 수 있습니다.</p>
             </div>
         </div>
         <footer>보고서 생성 시각: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</footer>
