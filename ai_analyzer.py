@@ -656,11 +656,17 @@ class AIAnalyzer:
 
 [조사 및 선별 조건]  
 1. 출처는 반드시 Red Hat 공식 보안 자료(예: Red Hat Security Advisories, Red Hat CVE 데이터베이스) 기반으로 하며, RHEL 외 다른 리눅스 배포판(Ubuntu, Debian 등)은 제외합니다.  
-2. 중요도는 Important 또는 Critical 등급의 취약점에 한정합니다.  
-3. 우선순위는 "kernel, glibc, openssl, openssh, systemd" 관련 취약점으로 하며, 이 중 5개를 무작위로 선별합니다.  
-4. 선별된 취약점은 Red Hat 공식 사이트 및 신뢰할 수 있는 보안 사이트(cve.mitre.org, nvd.nist.gov)에서 검증 후, RHEL 환경에서의 영향과 대응 현황을 중심으로 간략히 요약합니다.  
+2. 중요도는 Important 또는 Critical 등급의 취약점에 한정하며, 우선순위는 "kernel, glibc, openssl, openssh, systemd" 관련 취약점을 조사하여 이중에서 사람들이 가장 많이 찾는 보안이슈 5개를 선정합니다. 
+    - 보안 이슈 조사 과정에서 아래의 [참고 사이트]에 정보가 존재 한다면 우선으로 처리해줘.
+        [참고 사이트]
+        - https://knvd.krcert.or.kr/
+        - https://asec.ahnlab.com/ko/category/vulnerability-ko/
+        - https://www.boho.or.kr/
+        - https://boannews.com/
+
+3. 선별된 취약점은 Red Hat 공식 사이트 및 신뢰할 수 있는 보안 사이트(cve.mitre.org, nvd.nist.gov)에서 검증 후, RHEL 환경에서의 영향과 대응 현황을 중심으로 간략히 요약합니다.  
    - 기술적 세부사항보다는 보안 커뮤니티 논의, 주요 기업 반응, 패치 상태 위주로 작성합니다.  
-5. 필요시 "Web Search" 기능을 활성화하여 최신 정보와 추가 의견을 확보하세요.  
+4. 필요시 "Web Search" 기능을 활성화하여 최신 정보와 추가 의견을 확보하세요.  
 
 [출력 형식 예시]  
 - CVE 번호 및 취약점명  
@@ -675,6 +681,7 @@ class AIAnalyzer:
 
 CVE 목록: {', '.join(cve_identifiers)}
 응답은 반드시 다음 JSON 형식이어야 해. 가장 중요한 5개의 CVE에 대한 분석만 객체로 포함해야 해.
+
 ```json
 {{
   "cve_trends": [
