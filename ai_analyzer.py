@@ -58,6 +58,28 @@ class SosreportParser:
                     print(f"경고: '{file_path}' 파일 읽기 오류: {e}")
                     return "파일 읽기 오류"
         return default
+    
+    # [개선된 기능] 설치된 패키지 이름과 버전을 모두 파싱하는 함수
+    def _parse_installed_packages(self) -> List[str]:
+        """installed-rpms 파일에서 '패키지-버전-릴리즈' 전체 문자열을 파싱합니다."""
+        rpm_content = self._read_file(['installed-rpms', 'sos_commands/rpm/rpm_-qa', 'rpm-qa'])
+        if rpm_content == 'N/A':
+            return []
+        
+        packages = []
+        for line in rpm_content.split('\n'):
+            line = line.strip()
+            if not line or line.startswith(('gpg-pubkey', 'warning:', 'error:')):
+                continue
+            # 공백으로 구분된 첫 번째 필드가 패키지 정보일 수 있음 (dnf/yum list installed)
+            parts = line.split()
+            if len(parts) > 0:
+                # 'httpd-2.4.37-56.el8.x86_64'와 같은 형식의 전체 문자열을 저장
+                packages.append(parts[0])
+
+        unique_packages = sorted(list(set(packages)))
+        print(f"✅ 설치된 패키지(버전 포함) 파싱 완료: {len(unique_packages)}개")
+        return unique_packages
 
     def _parse_system_details(self) -> Dict[str, Any]:
         """xsos 스타일의 상세 시스템 정보를 파싱합니다."""
@@ -381,6 +403,7 @@ class SosreportParser:
             "process_stats": self._parse_process_stats(),
             "failed_services": self._parse_failed_services(),
             "performance_data": self._parse_sar_data(),
+            "installed_packages": self._parse_installed_packages(),
             "analysis_timestamp": datetime.now().isoformat()
         }
         print("✅ sosreport 데이터 파싱 완료.")
@@ -605,12 +628,17 @@ class AIAnalyzer:
             print(error_message)
             raise ValueError(error_message)
 
+    # [개선된 기능] 보안 뉴스 조회 및 AI 분석 프롬프트
     def fetch_security_news(self, sos_data: Dict[str, Any]) -> List[Dict[str, str]]:
-        """RHEL 관련 최신 보안 뉴스를 현재 시스템 커널 버전을 참고하여 선별하고, 선별 이유를 로깅합니다."""
+        """RHEL 관련 최신 보안 뉴스를 현재 시스템의 패키지 및 커널 버전을 참고하여 선별하고, 선별 이유를 로깅합니다."""
         print("최신 RHEL 보안 뉴스 조회 중 (Red Hat API 직접 호출)...")
         try:
             kernel_version = sos_data.get("system_info", {}).get("kernel", "N/A")
+            installed_packages_full = sos_data.get("installed_packages", [])
+            installed_package_names = set(re.sub(r'-[\d.:].*', '', pkg) for pkg in installed_packages_full)
+
             print(f"분석 대상 시스템 커널 버전: {kernel_version}")
+            print(f"분석 대상 시스템의 설치된 패키지 {len(installed_packages_full)}개를 참고합니다.")
 
             # 1. Red Hat의 공식 CVE 데이터 API를 직접 호출
             api_url = "https://access.redhat.com/hydra/rest/securitydata/cve.json"
@@ -623,36 +651,66 @@ class AIAnalyzer:
             all_cves = response.json()
             print(f"총 {len(all_cves)}개의 CVE 데이터를 가져왔습니다.")
             
-            # 2. 데이터 필터링 (미래 CVE 제외, 최근 180일, Critical/Important 등급)
+            # 2. 데이터 필터링 (최근 180일, Critical/Important 등급)
             now = datetime.now()
             start_date = now - timedelta(days=180)
             
-            filtered_cves = []
+            directly_relevant_cves = []
+            contextually_relevant_cves = []
+
             for cve in all_cves:
                 public_date_str = cve.get('public_date')
-                if not public_date_str:
-                    continue
+                if not public_date_str: continue
                 
                 try:
                     cve_date = datetime.fromisoformat(public_date_str.replace('Z', '+00:00')).replace(tzinfo=None)
                 except ValueError:
-                    print(f"경고: 잘못된 날짜 형식으로 CVE를 건너뜁니다: {cve.get('CVE')}, {public_date_str}")
                     continue
 
-                if (cve_date <= now and 
-                    cve_date >= start_date and 
-                    isinstance(cve.get('severity'), str) and 
-                    cve.get('severity').lower() in ["critical", "important"]):
-                    filtered_cves.append(cve)
-
-            print(f"필터링 후: {len(filtered_cves)}개 CVE")
-
-            if not filtered_cves:
-                print("분석할 최신 보안 뉴스가 없습니다.")
-                return []
+                if not (start_date <= cve_date <= now and isinstance(cve.get('severity'), str) and cve.get('severity').lower() in ["critical", "important"]):
+                    continue
+                
+                # [핵심 로직] 설치된 패키지와 직접적인 연관성 검사
+                is_direct_match = False
+                affected_packages = cve.get('affected_packages', [])
+                if affected_packages:
+                    for pkg_str in affected_packages:
+                        # 'httpd-2.4.37-56.el8' 와 같은 문자열에서 패키지 이름 'httpd'만 추출
+                        pkg_name_match = re.match(r'^([a-zA-Z0-9_.+-]+)-', pkg_str)
+                        if pkg_name_match and pkg_name_match.group(1) in installed_package_names:
+                            is_direct_match = True
+                            break # 하나라도 일치하면 검사 중단
+                
+                if is_direct_match:
+                    directly_relevant_cves.append(cve)
+                else:
+                    contextually_relevant_cves.append(cve)
             
-            # 3. [1단계 AI 분석] 가장 중요한 CVE 5개 선정 및 이유 기록
-            cve_identifiers = [cve['CVE'] for cve in filtered_cves]
+            print(f"필터링 후: 직접 관련 CVE {len(directly_relevant_cves)}개, 정황상 관련 CVE {len(contextually_relevant_cves)}개")
+
+            if not directly_relevant_cves:
+                print("시스템에 직접적인 영향을 주는 최신 보안 뉴스가 없습니다.")
+                # 직접 관련 CVE가 없으면 정황상 관련 CVE를 분석 대상으로 사용
+                if not contextually_relevant_cves:
+                    print("분석할 보안 뉴스가 없습니다.")
+                    return []
+                analysis_target_cves = contextually_relevant_cves
+                is_direct_analysis = False
+            else:
+                analysis_target_cves = directly_relevant_cves
+                is_direct_analysis = True
+
+            # 3. [1단계 AI 분석] 가장 중요한 CVE 5개 선정
+            cve_identifiers = [cve['CVE'] for cve in analysis_target_cves]
+            packages_str = "\n- ".join(installed_packages_full[:50]) + ("..." if len(installed_packages_full) > 50 else "")
+
+            # AI 프롬프트에 전달할 분석 대상 CVE 목록 설명
+            target_cve_description = (
+                "아래 목록은 현재 시스템에 설치된 패키지에 직접적인 영향을 미치는 것으로 확인된 CVE입니다. **이 목록 내에서만** 분석하고 선정하십시오." 
+                if is_direct_analysis 
+                else "시스템에 직접적인 영향을 주는 CVE는 발견되지 않았습니다. 대신, 시스템의 커널 버전과 주요 컴포넌트를 고려하여 아래의 정황상 관련성이 높은 CVE 목록을 분석하십시오."
+            )
+
             selection_prompt = f"""
 [시스템 안내]
 당신은 Red Hat Enterprise Linux(RHEL)를 전문으로 다루는 '시니어 보안 위협 분석가'입니다.
@@ -660,20 +718,23 @@ class AIAnalyzer:
 
 [분석 대상 시스템 정보]
 - **커널 버전:** {kernel_version}
+- **설치된 패키지 목록 (일부):**
+- {packages_str}
 
 [선별 기준]
-1.  **시스템 연관성:** [분석 대상 시스템 정보]의 커널 버전에 직접적인 영향을 미치는 취약점을 **최우선**으로 고려합니다.
+1.  **영향받는 핵심 컴포넌트:** `kernel`, `glibc`, `openssl`, `openssh`, `systemd` 등 RHEL 시스템의 핵심 컴포넌트에 영향을 주는 취약점을 우선적으로 다룹니다.
 2.  **RHEL 관련성:** 반드시 Red Hat에서 공식적으로 RHEL에 영향을 미친다고 확인한 취약점이어야 합니다.
-3.  **실제 공격 가능성(Exploitability):** 공개된 공격 코드가 있거나, 실제 공격(In-the-wild)에 사용된 사례가 있는 취약점을 우선으로 고려합니다.
-4.  **영향받는 핵심 컴포넌트:** `kernel`, `glibc`, `openssl`, `openssh`, `systemd` 등 RHEL 시스템의 핵심 컴포넌트에 영향을 주는 취약점을 우선적으로 다룹니다.
+3.  **커널 연관성:** 현재 시스템의 커널 버전에 직접적인 영향을 미치는 취약점을 우선으로 고려합니다.
+4.  **실제 공격 가능성(Exploitability):** 공개된 공격 코드가 있거나, 실제 공격(In-the-wild)에 사용된 사례가 있는 취약점을 우선으로 고려합니다.
 
 [입력 데이터]
+{target_cve_description}
 분석 대상 RHEL 관련 CVE 목록: {', '.join(cve_identifiers)}
 
 [출력 지시]
-위 선별 기준에 따라 선정한 Top 5 CVE에 대한 정보를 아래 JSON 형식에 맞춰 **오직 JSON 객체만** 출력하십시오.
+위 선별 기준을 종합적으로 적용하여 선정한 Top 5 CVE에 대한 정보를 아래 JSON 형식에 맞춰 **오직 JSON 객체만** 출력하십시오.
 - `cve_id`: **반드시 [입력 데이터]에 존재하는 CVE ID 중에서만** 선택해야 합니다.
-- `selection_reason`: 왜 이 CVE를 선택했는지 선별 기준(특히 시스템 연관성)에 근거하여 **한국어로 명확하고 간결하게** 기술해야 합니다. (예: "현재 시스템 커널 버전에 직접적인 영향을 주는 심각한 권한 상승 취약점임.")
+- `selection_reason`: 왜 이 CVE를 선택했는지 선별 기준(특히 **시스템 패키지 연관성**)에 근거하여 **한국어로 명확하고 간결하게** 기술해야 합니다. (예: "시스템에 설치된 'httpd-2.4.37-56.el8.x86_64' 패키지에 직접적인 영향을 주는 원격 코드 실행 취약점임.")
 
 ```json
 {{
@@ -697,7 +758,7 @@ class AIAnalyzer:
             llm_log_path = self.output_dir / "llm_security_news.log"
             selected_cves_from_llm = selection_result['cve_selection']
             
-            original_cves_map = {cve['CVE']: cve for cve in filtered_cves}
+            original_cves_map = {cve['CVE']: cve for cve in analysis_target_cves}
             
             top_cves_data = []
             with open(llm_log_path, 'a', encoding='utf-8') as f:
