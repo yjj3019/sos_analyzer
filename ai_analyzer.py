@@ -100,8 +100,16 @@ class SosreportParser:
         details = {}
         details['hostname'] = self._read_file(['hostname', 'sos_commands/general/hostname', 'proc/sys/kernel/hostname'])
         details['os_version'] = self._read_file(['etc/redhat-release'])
+        
+        # Kernel 버전만 정확히 추출
         uname_content = self._read_file(['uname', 'sos_commands/kernel/uname_-a'])
-        details['kernel'] = uname_content.split('\n')[0]
+        uname_line = uname_content.split('\n')[0]
+        parts = uname_line.split()
+        if len(parts) >= 3:
+            details['kernel'] = parts[2]
+        else:
+            details['kernel'] = uname_line # Fallback
+
         dmidecode_content = self._read_file(['dmidecode', 'sos_commands/hardware/dmidecode'])
         model_match = re.search(r'Product Name:\s*(.*)', dmidecode_content)
         details['system_model'] = model_match.group(1).strip() if model_match else 'N/A'
@@ -112,8 +120,19 @@ class SosreportParser:
         meminfo_content = self._read_file(['proc/meminfo'])
         mem_total = re.search(r'MemTotal:\s+(\d+)\s+kB', meminfo_content)
         details['memory'] = f"{int(mem_total.group(1)) / 1024 / 1024:.1f} GiB" if mem_total else 'N/A'
-        details['uptime'] = self._read_file(['uptime', 'sos_commands/general/uptime', 'sos_commands/host/uptime'])
         
+        # Uptime 정보만 정확히 추출
+        uptime_content = self._read_file(['uptime', 'sos_commands/general/uptime', 'sos_commands/host/uptime'])
+        uptime_match = re.search(r'up\s+(.*?),\s+\d+\s+user', uptime_content)
+        if uptime_match:
+            details['uptime'] = uptime_match.group(1).strip()
+        else:
+            uptime_match_simple = re.search(r'up\s+(.*)', uptime_content)
+            if uptime_match_simple:
+                 details['uptime'] = uptime_match_simple.group(1).split(',')[0].strip()
+            else:
+                 details['uptime'] = uptime_content # Final fallback
+
         last_boot_str = "N/A"
         proc_stat_content = self._read_file(['proc/stat'])
         btime_match = re.search(r'^btime\s+(\d+)', proc_stat_content, re.MULTILINE)
@@ -397,22 +416,73 @@ class SosreportParser:
 
     def _parse_log_messages(self) -> List[str]:
         """
-        var/log/messages 파일에서 오류 및 경고와 관련된 로그를 파싱합니다.
+        var/log/messages* 파일에서 중복을 제거하고 핵심적인 오류 및 경고 로그를 지능적으로 추출합니다.
         """
         log_content = self._read_file(['var/log/messages', 'var/log/syslog'])
         if log_content == 'N/A' or not log_content.strip():
             print("⚠️ 'var/log/messages' 파일을 찾을 수 없거나 내용이 비어 있습니다.")
             return []
 
-        keywords = ['error', 'failed', 'warning', 'critical']
-        relevant_lines = []
-        for line in log_content.split('\n'):
-            if any(keyword in line.lower() for keyword in keywords):
-                relevant_lines.append(line)
+        # 더 구체적이고 심각도 높은 키워드 추가
+        keywords = [
+            'error', 'failed', 'critical', 'panic', 'segfault', 
+            'out of memory', 'i/o error', 'hardware error', 'nmi', 'call trace'
+        ]
+        warning_keyword = 'warning'
 
-        last_lines = relevant_lines[-500:]
-        print(f"✅ 'var/log/messages'에서 관련 로그 {len(last_lines)}줄을 추출했습니다.")
-        return last_lines
+        unique_logs = {}
+
+        # 로그 메시지에서 타임스탬프, 호스트명, 프로세스명/PID를 제거하는 정규식
+        log_prefix_re = re.compile(
+            r'^[A-Za-z]{3}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2}\s+[\w.-]+\s+[^:]+:\s+'
+        )
+        
+        lines = log_content.split('\n')
+        print(f"총 {len(lines)}줄의 로그를 분석하여 핵심 메시지를 추출합니다...")
+
+        for line in lines:
+            line_lower = line.lower()
+            if not any(keyword in line_lower for keyword in keywords) and warning_keyword not in line_lower:
+                continue
+
+            core_message = log_prefix_re.sub('', line)
+            if not core_message:
+                core_message = line
+
+            # 가변적인 부분을 일반화하여 그룹화
+            normalized_message = re.sub(r'\b(sda|sdb|sdc|nvme0n1)\d*\b', 'sdX', core_message)
+            normalized_message = re.sub(r'\b\d{4,}\b', 'N', normalized_message)
+            normalized_message = re.sub(r'0x[0-9a-fA-F]+', '0xADDR', normalized_message)
+            normalized_message = re.sub(r'\[\s*\d+\.\d+\]', '', normalized_message).strip()
+
+            if not normalized_message:
+                continue
+
+            if normalized_message not in unique_logs:
+                unique_logs[normalized_message] = {
+                    'original_line': line,
+                    'count': 0
+                }
+            unique_logs[normalized_message]['count'] += 1
+
+        if not unique_logs:
+            print("✅ 'var/log/messages'에서 심각한 오류나 경고가 발견되지 않았습니다.")
+            return []
+
+        sorted_logs = sorted(unique_logs.items(), key=lambda item: item[1]['count'], reverse=True)
+
+        formatted_results = []
+        for normalized, data in sorted_logs[:100]:
+            count = data['count']
+            original_line = data['original_line']
+            timestamp_match = re.match(r'^([A-Za-z]{3}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2})', original_line)
+            timestamp = timestamp_match.group(1) if timestamp_match else "Timestamp N/A"
+
+            formatted_line = f"[{count}회] {timestamp} - {normalized}"
+            formatted_results.append(formatted_line)
+        
+        print(f"✅ 'var/log/messages'에서 {len(formatted_results)}개의 고유한 문제성 로그 그룹을 추출했습니다.")
+        return formatted_results
 
     def parse(self) -> Dict[str, Any]:
         """주요 sosreport 파일들을 파싱하여 딕셔너리로 반환합니다."""
@@ -593,15 +663,21 @@ class AIAnalyzer:
 {data_str}
 ```
 
+## 분석 가이드라인
+- **심각한 이슈(critical_issues) 판단 기준**: 로그 내용에 'panic', 'segfault', 'out of memory', 'hardware error', 'i/o error', 'call trace'와 같은 명백한 시스템 장애나 데이터 손상 가능성을 암시하는 키워드가 포함된 경우, **반드시 '심각한 이슈'로 분류**해야 합니다.
+- **경고(warnings) 판단 기준**: 당장 시스템 장애를 일으키지는 않지만, 잠재적인 문제로 발전할 수 있거나 주의가 필요한 로그(예: 'warning', 'failed' 등)는 '경고'로 분류합니다.
+
 ## 분석 요청
-위 데이터, 특히 **`recent_log_warnings_and_errors`에 포함된 시스템 로그 메시지를 주의 깊게 분석**하여 다음 JSON 형식에 맞춰 종합적인 시스템 분석을 제공해주세요. 로그에서 발견된 구체적인 오류나 경고를 `critical_issues` 또는 `warnings` 항목에 반드시 반영해야 합니다. **특히, `recommendations`의 각 항목을 작성할 때, 어떤 로그 메시지를 근거로 해당 권장사항을 만들었는지 `related_logs` 필드에 명시해야 합니다.**
+위 데이터와 **분석 가이드라인**을 바탕으로, 특히 **`recent_log_warnings_and_errors`에 포함된 시스템 로그 메시지를 주의 깊게 분석**하여 다음 JSON 형식에 맞춰 종합적인 시스템 분석을 제공해주세요.
+- 로그에서 발견된 구체적인 오류나 경고를 `critical_issues` 또는 `warnings` 항목에 반드시 반영해야 합니다.
+- `recommendations`의 각 항목을 작성할 때, 어떤 로그 메시지를 근거로 해당 권장사항을 만들었는지 `related_logs` 필드에 명시해야 합니다.
 
 ```json
 {{
   "system_status": "정상|주의|위험",
   "overall_health_score": 100,
-  "critical_issues": ["발견된 심각한 문제들의 구체적인 설명 (로그 분석 내용 포함)"],
-  "warnings": ["주의가 필요한 사항들 (로그 분석 내용 포함)"],
+  "critical_issues": ["분석 가이드라인에 따라 식별된 심각한 문제들의 구체적인 설명"],
+  "warnings": ["주의가 필요한 사항들"],
   "recommendations": [
     {{
       "priority": "높음|중간|낮음",
@@ -743,7 +819,7 @@ class AIAnalyzer:
 [선별 기준]
 1.  **최신 동향 및 실제 위협(Web Search 활용):** Web Search를 통해 최신 보안 동향, 공개된 공격 코드(Exploit) 유무, 실제 공격(In-the-wild) 사례 등을 파악하여 위험도가 높다고 판단되는 CVE를 최우선으로 고려해야 합니다.
 2.  **시스템 패키지 연관성:** 주어진 목록의 모든 CVE는 이미 시스템에 설치된 패키지와 연관성이 확인된 상태입니다.
-3.  **영향받는 핵심 컴포넌트:** `kernel`, `glibc`, `openssl`, `openssh`, `systemd` 등 RHEL 시스템의 핵심 컴포넌트에 영향을 주는 취약점(Important, Critical)을 우선적으로 다룹니다.
+3.  **영향받는 핵심 컴포넌트:** `kernel`, `glibc`, `openssl`, `openssh`, `systemd` 등 RHEL 시스템의 핵심 컴포넌트에 영향을 주는 취약점 severity가 (important, critical)을 우선적으로 다룹니다.
 
 [입력 데이터]
 분석 대상 CVE 목록 (시스템 관련성 확인됨): {', '.join(cve_identifiers)}
@@ -1060,14 +1136,13 @@ class AIAnalyzer:
                 """
             return rows
 
-        def create_list_table(items: List[str], empty_message: str, row_class: str = "") -> str:
+        def create_list_table(items: List[str], empty_message: str) -> str:
             if not items:
                 return f"<tr><td style='text-align:center;'>{html.escape(empty_message)}</td></tr>"
             
             rows = ""
-            class_attr = f" class='{row_class}'" if row_class else ""
             for item in items:
-                rows += f"<tr{class_attr}><td>{html.escape(item)}</td></tr>"
+                rows += f"<tr><td>{html.escape(item)}</td></tr>"
             return rows
 
         graph_html = ""
@@ -1095,9 +1170,9 @@ class AIAnalyzer:
         for iface, data in ethtool_data.items():
             ethtool_rows += f"<tr><td>{html.escape(iface)}</td><td>{html.escape(data.get('link', 'N/A'))}</td><td>{html.escape(data.get('speed', 'N/A'))}</td><td>{html.escape(data.get('driver', 'N/A'))}</td><td>{html.escape(data.get('firmware', 'N/A'))}</td></tr>"
 
-        failed_services_rows = create_list_table(failed_services, "실패한 서비스가 없습니다.", "critical-row")
-        critical_issues_rows = create_list_table(critical_issues, "발견된 심각한 이슈가 없습니다.", "critical-row")
-        warnings_rows = create_list_table(warnings, "특별한 경고 사항이 없습니다.", "warning-row")
+        failed_services_rows = create_list_table(failed_services, "실패한 서비스가 없습니다.")
+        critical_issues_rows = create_list_table(critical_issues, "발견된 심각한 이슈가 없습니다.")
+        warnings_rows = create_list_table(warnings, "특별한 경고 사항이 없습니다.")
 
         html_template = f"""
 <!DOCTYPE html>
@@ -1154,8 +1229,6 @@ class AIAnalyzer:
             background-color: #e9ecef;
         }}
         .ai-status {{ font-size: 1.2em; font-weight: bold; color: {status_color}; }}
-        .critical-row td {{ background-color: #f8d7da !important; }}
-        .warning-row td {{ background-color: #fff3cd !important; }}
         footer {{ text-align: center; padding: 15px; font-size: 12px; color: #888; background-color: #f4f7f9; }}
         
         .tooltip {{ position: relative; display: inline-block; cursor: pointer; }}
@@ -1284,15 +1357,6 @@ class AIAnalyzer:
 
             <!-- AI 분석 및 보안 뉴스 섹션 (순서 변경됨) -->
             <div class="section">
-                <h2>💡 AI 분석: 권장사항 ({len(recommendations)}개)</h2>
-                <table class="data-table">
-                    <colgroup><col style="width:10%"><col style="width:15%"><col style="width:35%"><col style="width:40%"></colgroup>
-                    <thead><tr><th>우선순위</th><th>카테고리</th><th>문제점 💬</th><th>해결 방안</th></tr></thead>
-                    <tbody>{create_recommendation_rows(recommendations)}</tbody>
-                </table>
-            </div>
-            
-            <div class="section">
                 <h2>🚨 AI 분석: 심각한 이슈 ({len(critical_issues)}개)</h2>
                 <table class="data-table">
                     <colgroup><col style="width:100%"></colgroup>
@@ -1310,6 +1374,15 @@ class AIAnalyzer:
                 </table>
             </div>
 
+            <div class="section">
+                <h2>💡 AI 분석: 권장사항 ({len(recommendations)}개)</h2>
+                <table class="data-table">
+                    <colgroup><col style="width:10%"><col style="width:15%"><col style="width:35%"><col style="width:40%"></colgroup>
+                    <thead><tr><th>우선순위</th><th>카테고리</th><th>문제점 💬</th><th>해결 방안</th></tr></thead>
+                    <tbody>{create_recommendation_rows(recommendations)}</tbody>
+                </table>
+            </div>
+            
             <div class="section">
                 <h2>🤖 AI 종합 분석</h2>
                 <table class="data-table">
