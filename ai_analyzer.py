@@ -36,11 +36,9 @@ except ImportError:
     plt = None
 
 # --- 웹 스크레이핑을 위한 라이브러리 ---
-# "pip install beautifulsoup4 google-api-python-client" 명령어로 설치 필요
+# "pip install beautifulsoup4" 명령어로 설치 필요
 try:
     from bs4 import BeautifulSoup
-    # Web Search를 위한 google_search는 외부에서 제공되는 것으로 가정합니다.
-    # from google_search import search as google_search 
 except ImportError:
     BeautifulSoup = None
 
@@ -641,47 +639,12 @@ class AIAnalyzer:
             print(error_message)
             raise ValueError(error_message)
 
-    def fetch_web_search_cves(self, installed_package_names: set) -> set:
-        """Web Search를 통해 설치된 패키지와 관련된 최신 CVE 정보를 수집합니다."""
-        print("Web Search를 통해 최신 CVE 정보 수집 중...")
-        web_cves = set()
-        cve_pattern = re.compile(r'CVE-\d{4}-\d{4,7}', re.IGNORECASE)
-        
-        # 시스템의 핵심 패키지나 자주 사용되는 패키지를 우선 검색
-        priority_packages = ['kernel', 'openssl', 'glibc', 'httpd', 'openssh', 'systemd', 'qemu-kvm', 'libvirt', 'java']
-        search_packages = [pkg for pkg in priority_packages if pkg in installed_package_names]
-        # 만약 우선순위 패키지가 없다면, 전체 패키지 중 일부를 사용
-        if not search_packages:
-            search_packages = list(installed_package_names)[:5]
-
-        queries = []
-        for pkg in search_packages:
-            queries.append(f'"{pkg}" Red Hat Enterprise Linux vulnerability CVE')
-            queries.append(f'"{pkg}" RHEL 보안 취약점 CVE')
-
-        print(f"Web Search 쿼리: {queries}")
-
-        try:
-            # google_search가 외부에서 제공되는 함수라고 가정
-            search_results = google_search.search(queries=queries)
-            for result_set in search_results:
-                if result_set.results:
-                    for result in result_set.results:
-                        if result.snippet:
-                            found = cve_pattern.findall(result.snippet)
-                            for cve in found:
-                                web_cves.add(cve.upper())
-            print(f"Web Search를 통해 {len(web_cves)}개의 고유 CVE를 수집했습니다: {web_cves if web_cves else '없음'}")
-        except Exception as e:
-            print(f"⚠️ Web Search 중 오류 발생: {e}")
-
-        return web_cves
-
     def fetch_security_news(self, sos_data: Dict[str, Any]) -> List[Dict[str, str]]:
         """
-        Red Hat API와 Web Search를 통해 시스템에 가장 중요한 CVE를 선별합니다.
+        Red Hat API를 통해 시스템에 가장 중요한 CVE를 선별합니다.
+        LLM의 Web Search 기능을 활용하여 최신 동향을 반영합니다.
         """
-        print("최신 RHEL 보안 뉴스 조회 및 Web Search 정보와 교차 분석 시작...")
+        print("최신 RHEL 보안 뉴스 조회 및 분석 시작...")
         
         installed_packages_db = set(sos_data.get("installed_packages", []))
         if not installed_packages_db:
@@ -691,10 +654,6 @@ class AIAnalyzer:
 
         try:
             installed_package_names_only = set(re.sub(r'-[\d.:].*', '', pkg) for pkg in installed_packages_db)
-            
-            # [수정] Web Search 기능 호출
-            web_priority_cves = self.fetch_web_search_cves(installed_package_names_only)
-
             kernel_version = sos_data.get("system_info", {}).get("kernel", "N/A")
 
             print(f"분석 대상 시스템 커널 버전: {kernel_version}")
@@ -736,33 +695,15 @@ class AIAnalyzer:
                 return [{"reason": reason}]
 
             print(f"시스템 관련 CVE {len(system_relevant_cves)}개를 1차 선별했습니다.")
-
-            top_priority_cves = []
-            normal_priority_cves = []
-            for cve in system_relevant_cves:
-                if cve.get('CVE') in web_priority_cves:
-                    cve['priority_reason'] = "최신 웹 검색 결과에서 언급된, 시스템에 직접 영향을 주는 취약점"
-                    top_priority_cves.append(cve)
-                else:
-                    normal_priority_cves.append(cve)
             
-            analysis_target_cves = top_priority_cves + normal_priority_cves
-            print(f"우선순위 정렬 후: 웹 검색 언급 CVE {len(top_priority_cves)}개, 기타 시스템 관련 CVE {len(normal_priority_cves)}개")
-
-            cve_identifiers_with_priority = []
-            for cve in analysis_target_cves:
-                if 'priority_reason' in cve:
-                    cve_identifiers_with_priority.append(f"{cve['CVE']} (최우선)")
-                else:
-                    cve_identifiers_with_priority.append(cve['CVE'])
-
+            cve_identifiers = [cve['CVE'] for cve in system_relevant_cves]
             packages_str = "\n- ".join(list(installed_packages_db)[:50]) + ("..." if len(installed_packages_db) > 50 else "")
 
             selection_prompt = f"""
 [시스템 안내]
 당신은 Red Hat Enterprise Linux(RHEL)를 전문으로 다루는 '시니어 보안 위협 분석가'입니다.
 당신의 임무는 주어진 RHEL 관련 보안 취약점 목록을 분석하여, 특정 시스템에 가장 시급하고 중요한 Top 10을 선별하고, 그 선별 이유를 명확히 기록하는 것입니다.
-선별 과정에서 필요하다면 Web Search 를 활성화하여 검색을 진행합니다. 
+선별 과정에서 필요하다면 **Web Search**를 활성화하여 최신 정보를 검색하고 판단에 반영하십시오.
 
 [분석 대상 시스템 정보]
 - **커널 버전:** {kernel_version}
@@ -770,25 +711,24 @@ class AIAnalyzer:
 - {packages_str}
 
 [선별 기준]
-1.  **웹 동향 (최우선):** 목록에서 `(최우선)`으로 표시된 CVE는 시스템에 직접적인 영향을 주면서 최신 웹 검색에서도 언급된 시급한 취약점이므로 반드시 최우선으로 고려해야 합니다.
+1.  **최신 동향 및 실제 위협(Web Search 활용):** Web Search를 통해 최신 보안 동향, 공개된 공격 코드(Exploit) 유무, 실제 공격(In-the-wild) 사례 등을 파악하여 위험도가 높다고 판단되는 CVE를 최우선으로 고려해야 합니다.
 2.  **시스템 패키지 연관성:** 주어진 목록의 모든 CVE는 이미 시스템에 설치된 패키지와 연관성이 확인된 상태입니다.
-3.  **영향받는 핵심 컴포넌트:** `kernel`, `glibc`, `openssl`, `openssh`, `systemd` 등 RHEL 시스템의 핵심 컴포넌트에 영향을 주는 취약점을 우선적으로 다룹니다.
-4.  **실제 공격 가능성(Exploitability):** 공개된 공격 코드가 있거나, 실제 공격(In-the-wild)에 사용된 사례가 있는 취약점을 우선으로 고려합니다.
+3.  **영향받는 핵심 컴포넌트:** `kernel`, `glibc`, `openssl`, `openssh`, `systemd` 등 RHEL 시스템의 핵심 컴포넌트에 영향을 주는 취약점(Important, Critical)을 우선적으로 다룹니다.
 
 [입력 데이터]
-분석 대상 CVE 목록 (모두 시스템 관련성이 있으며, 우선순위 순으로 정렬됨): {', '.join(cve_identifiers_with_priority)}
+분석 대상 CVE 목록 (시스템 관련성 확인됨): {', '.join(cve_identifiers)}
 
 [출력 지시]
 위 선별 기준을 종합적으로 적용하여 선정한 Top 10 CVE에 대한 정보를 아래 JSON 형식에 맞춰 **오직 JSON 객체만** 출력하십시오.
 - `cve_id`: **반드시 [입력 데이터]에 존재하는 CVE ID 중에서만** 선택해야 합니다.
-- `selection_reason`: 왜 이 CVE를 선택했는지 선별 기준(특히 웹 동향 및 시스템 패키지 연관성)에 근거하여 **한국어로 명확하고 간결하게** 기술해야 합니다.
+- `selection_reason`: 왜 이 CVE를 선택했는지 선별 기준(특히 웹 검색을 통해 파악한 최신 동향 및 실제 위협)에 근거하여 **한국어로 명확하고 간결하게** 기술해야 합니다.
 
 ```json
 {{
   "cve_selection": [
     {{
       "cve_id": "CVE-XXXX-XXXX",
-      "selection_reason": "이 CVE를 선별한 구체적인 이유"
+      "selection_reason": "이 CVE를 선별한 구체적인 이유 (예: 최근 공격 코드가 공개되었으며, 시스템의 OpenSSL 패키지에 직접적인 영향을 줌)"
     }}
   ]
 }}
@@ -804,7 +744,7 @@ class AIAnalyzer:
             llm_log_path = self.output_dir / "llm_security_news.log"
             selected_cves_from_llm = selection_result['cve_selection']
             
-            original_cves_map = {cve['CVE']: cve for cve in analysis_target_cves}
+            original_cves_map = {cve['CVE']: cve for cve in system_relevant_cves}
             
             top_cves_data = []
             with open(llm_log_path, 'a', encoding='utf-8') as f:
@@ -1124,7 +1064,7 @@ class AIAnalyzer:
                 </table>
             </div>
             <div class="section">
-                <h2>� 스토리지 및 파일 시스템</h2>
+                <h2>💾 스토리지 및 파일 시스템</h2>
                 <table class="data-table">
                     <thead><tr><th>Filesystem</th><th>Size</th><th>Used</th><th>Avail</th><th>Use%</th><th>Mounted on</th></tr></thead>
                     <tbody>{create_table_rows(storage_info, ['filesystem', 'size', 'used', 'avail', 'use%', 'mounted_on'])}</tbody>
