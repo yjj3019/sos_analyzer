@@ -594,7 +594,7 @@ class AIAnalyzer:
 ```
 
 ## 분석 요청
-위 데이터, 특히 **`recent_log_warnings_and_errors`에 포함된 시스템 로그 메시지를 주의 깊게 분석**하여 다음 JSON 형식에 맞춰 종합적인 시스템 분석을 제공해주세요. 로그에서 발견된 구체적인 오류나 경고를 `critical_issues` 또는 `warnings` 항목에 반드시 반영해야 합니다.
+위 데이터, 특히 **`recent_log_warnings_and_errors`에 포함된 시스템 로그 메시지를 주의 깊게 분석**하여 다음 JSON 형식에 맞춰 종합적인 시스템 분석을 제공해주세요. 로그에서 발견된 구체적인 오류나 경고를 `critical_issues` 또는 `warnings` 항목에 반드시 반영해야 합니다. **특히, `recommendations`의 각 항목을 작성할 때, 어떤 로그 메시지를 근거로 해당 권장사항을 만들었는지 `related_logs` 필드에 명시해야 합니다.**
 
 ```json
 {{
@@ -607,14 +607,15 @@ class AIAnalyzer:
       "priority": "높음|중간|낮음",
       "category": "성능|보안|안정성|유지보수",
       "issue": "문제점 설명",
-      "solution": "구체적인 해결 방안"
+      "solution": "구체적인 해결 방안",
+      "related_logs": ["이 권장사항의 근거가 된 특정 로그 메시지(들)"]
     }}
   ],
   "summary": "전체적인 시스템 상태와 주요 권장사항에 대한 종합 요약"
 }}
 ```
 
-**중요**: 당신의 응답은 반드시 위 JSON 형식이어야 합니다. 다른 설명이나 텍스트 없이, `{{`로 시작해서 `}}`로 끝나는 순수한 JSON 객체만 출력해야 합니다.
+**중요**: 당신의 응답은 반드시 위 JSON 형식이어야 합니다. 다른 설명이나 텍스트 없이, `{{`로 시작해서 `}}`로 끝나는 순수한 JSON 객체만 출력해야 합니다. `related_logs` 필드는 근거가 된 로그가 없을 경우 빈 배열 `[]`로 출력해주세요.
 """
         return prompt
 
@@ -808,7 +809,7 @@ class AIAnalyzer:
 
             processing_prompt = f"""
 [시스템 안내]
-당신은 전문 기술 번역가입니다. 다음 JSON 데이터에 포함된 각 CVE의 'description'을 자연스러운 한국어로 번역해주십시오.
+당신은 Red Hat Enterprise Linux(RHEL) 보안 전문가입니다. 당신의 임무는 주어진 각 CVE의 영문 기술 설명을 분석하여, 시스템 관리자가 쉽게 이해할 수 있도록 핵심 내용과 시스템에 미치는 영향을 중심으로 자연스러운 한국어로 요약 및 설명하는 것입니다.
 
 [입력 데이터]
 ```json
@@ -816,14 +817,14 @@ class AIAnalyzer:
 ```
 
 [출력 지시]
-아래 JSON 형식에 맞춰, 번역된 결과를 **오직 JSON 객체만** 출력하십시오.
+아래 JSON 형식에 맞춰, 각 CVE에 대한 알기 쉬운 요약 설명을 포함하여 **오직 JSON 객체만** 출력하십시오. 단순 번역이 아닌, 위협의 본질과 잠재적 영향을 명확히 전달해야 합니다.
 
 ```json
 {{
   "processed_cves": [
     {{
       "cve_id": "CVE-XXXX-XXXX",
-      "translated_description": "자연스러운 한국어로 번역된 기술 요약"
+      "translated_description": "해당 CVE의 핵심 위협과 시스템에 미치는 영향에 대한 쉽고 명확한 한국어 요약 설명"
     }}
   ]
 }}
@@ -1026,6 +1027,48 @@ class AIAnalyzer:
                     </tr>
                 """
             return rows
+        
+        def create_recommendation_rows(recommendations_list):
+            rows = ""
+            if not recommendations_list:
+                return "<tr><td colspan='4' style='text-align:center;'>데이터 없음</td></tr>"
+            
+            for item in recommendations_list:
+                priority = html.escape(str(item.get('priority', 'N/A')))
+                category = html.escape(str(item.get('category', 'N/A')))
+                issue = html.escape(str(item.get('issue', 'N/A')))
+                solution = html.escape(str(item.get('solution', 'N/A')))
+                related_logs = item.get('related_logs', [])
+
+                issue_html = issue
+                if related_logs:
+                    logs_html = html.escape('\n'.join(related_logs))
+                    issue_html += f"""
+                        <div class="tooltip">
+                            <span class="log-icon">💬</span>
+                            <span class="tooltiptext">{logs_html}</span>
+                        </div>
+                    """
+
+                rows += f"""
+                    <tr>
+                        <td>{priority}</td>
+                        <td>{category}</td>
+                        <td>{issue_html}</td>
+                        <td>{solution}</td>
+                    </tr>
+                """
+            return rows
+
+        def create_list_table(items: List[str], empty_message: str, row_class: str = "") -> str:
+            if not items:
+                return f"<tr><td style='text-align:center;'>{html.escape(empty_message)}</td></tr>"
+            
+            rows = ""
+            class_attr = f" class='{row_class}'" if row_class else ""
+            for item in items:
+                rows += f"<tr{class_attr}><td>{html.escape(item)}</td></tr>"
+            return rows
 
         graph_html = ""
         if graphs:
@@ -1052,6 +1095,10 @@ class AIAnalyzer:
         for iface, data in ethtool_data.items():
             ethtool_rows += f"<tr><td>{html.escape(iface)}</td><td>{html.escape(data.get('link', 'N/A'))}</td><td>{html.escape(data.get('speed', 'N/A'))}</td><td>{html.escape(data.get('driver', 'N/A'))}</td><td>{html.escape(data.get('firmware', 'N/A'))}</td></tr>"
 
+        failed_services_rows = create_list_table(failed_services, "실패한 서비스가 없습니다.", "critical-row")
+        critical_issues_rows = create_list_table(critical_issues, "발견된 심각한 이슈가 없습니다.", "critical-row")
+        warnings_rows = create_list_table(warnings, "특별한 경고 사항이 없습니다.", "warning-row")
+
         html_template = f"""
 <!DOCTYPE html>
 <html lang="ko">
@@ -1062,53 +1109,92 @@ class AIAnalyzer:
     <style>
         @import url('https://cdn.jsdelivr.net/gh/projectnoonnu/noonfonts_six@1.2/S-CoreDream.css');
         body {{ font-family: 'S-CoreDream', 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background-color: #f4f7f9; color: #333; margin: 0; padding: 20px; }}
-        .container {{ max-width: 900px; margin: auto; background: #fff; border-radius: 8px; box-shadow: 0 4px 8px rgba(0,0,0,0.1); overflow: hidden; }}
-        header {{ background-color: #007bff; color: white; padding: 20px; text-align: center; }}
+        .container {{ max-width: 1000px; margin: auto; background: #fff; border-radius: 8px; box-shadow: 0 4px 8px rgba(0,0,0,0.1); overflow: hidden; }}
+        header {{ background-color: #343a40; color: white; padding: 20px; text-align: center; }}
         header h1 {{ margin: 0; font-size: 24px; }}
         .content {{ padding: 20px; }}
-        .section {{ margin-bottom: 20px; }}
-        .section h2 {{ border-bottom: 2px solid #007bff; padding-bottom: 10px; margin-bottom: 15px; color: #007bff; }}
-        .info-table, .data-table {{ width: 100%; border-collapse: collapse; margin-bottom: 20px; }}
-        .info-table th, .info-table td, .data-table th, .data-table td {{ border: 1px solid #ddd; padding: 10px; text-align: left; word-break: break-all; }}
-        .info-table th {{ background-color: #f2f2f2; width: 25%; font-weight: bold; }}
-        .data-table th {{ background-color: #f2f2f2; font-weight: bold; }}
-        .issue-list li {{ background: #fff3cd; border-left: 4px solid #ffc107; margin-bottom: 10px; padding: 10px; list-style-type: none; }}
-        .critical-list li {{ background: #f8d7da; border-left-color: #dc3545; }}
-        .ai-summary-card {{ background-color: #e9ecef; padding: 20px; border-radius: 8px; }}
-        .ai-status {{ font-size: 1.5em; font-weight: bold; color: {status_color}; }}
+        .section {{ margin-bottom: 25px; }}
+        .section h2 {{ 
+            font-size: 20px;
+            border-left: 5px solid #007bff; 
+            padding-left: 10px; 
+            margin-bottom: 15px; 
+            color: #343a40; 
+        }}
+        .data-table {{
+            width: 100%;
+            border-collapse: collapse;
+            margin-bottom: 20px;
+            table-layout: fixed;
+            font-size: 14px;
+            line-height: 1.6;
+        }}
+        .data-table th, .data-table td {{
+            border: 1px solid #dee2e6;
+            padding: 12px;
+            text-align: left;
+            word-wrap: break-word;
+            vertical-align: top;
+        }}
+        .data-table thead th {{
+            background-color: #f8f9fa;
+            color: #495057;
+            font-weight: 600;
+            border-bottom: 2px solid #dee2e6;
+        }}
+        .data-table tbody th {{
+            background-color: #f8f9fa;
+            font-weight: 600;
+            width: 25%;
+        }}
+        .data-table tbody tr:nth-child(even) {{
+            background-color: #f8f9fa;
+        }}
+        .data-table tbody tr:hover {{
+            background-color: #e9ecef;
+        }}
+        .ai-status {{ font-size: 1.2em; font-weight: bold; color: {status_color}; }}
+        .critical-row td {{ background-color: #f8d7da !important; }}
+        .warning-row td {{ background-color: #fff3cd !important; }}
         footer {{ text-align: center; padding: 15px; font-size: 12px; color: #888; background-color: #f4f7f9; }}
         
         .tooltip {{ position: relative; display: inline-block; cursor: pointer; }}
         .tooltip .tooltiptext {{
-            visibility: hidden; width: 220px; background-color: #555; color: #fff; text-align: center;
-            border-radius: 6px; padding: 5px 0; position: absolute; z-index: 1; bottom: 125%;
-            left: 50%; margin-left: -110px; opacity: 0; transition: opacity 0.3s; font-size: 12px;
+            visibility: hidden; width: 450px; max-height: 250px; overflow-y: auto; background-color: #333; color: #fff; text-align: left;
+            border-radius: 6px; padding: 10px; position: absolute; z-index: 1; bottom: 125%;
+            left: 50%; margin-left: -225px; opacity: 0; transition: opacity 0.3s; font-size: 12px;
+            white-space: pre-wrap; word-break: break-all; box-shadow: 0 2px 5px rgba(0,0,0,0.2);
+            font-family: 'Consolas', 'Monaco', monospace;
         }}
         .tooltip .tooltiptext::after {{
             content: ""; position: absolute; top: 100%; left: 50%; margin-left: -5px;
-            border-width: 5px; border-style: solid; border-color: #555 transparent transparent transparent;
+            border-width: 5px; border-style: solid; border-color: #333 transparent transparent transparent;
         }}
         .tooltip:hover .tooltiptext {{ visibility: visible; opacity: 1; }}
+        .log-icon {{ font-size: 14px; margin-left: 5px; color: #007bff; }}
     </style>
 </head>
 <body>
     <div class="container">
         <header><h1>S-Core System Report</h1></header>
         <div class="content">
+            
             <div class="section">
                 <h2>ℹ️ 시스템 요약</h2>
-                <table class="info-table">
-                    <tr><th>Hostname</th><td>{html.escape(system_info.get('hostname', 'N/A'))}</td></tr>
-                    <tr><th>OS Version</th><td>{html.escape(system_info.get('os_version', 'N/A'))}</td></tr>
-                    <tr><th>Kernel</th><td>{html.escape(system_info.get('kernel', 'N/A'))}</td></tr>
-                    <tr><th>System Model</th><td>{html.escape(system_info.get('system_model', 'N/A'))}</td></tr>
-                    <tr><th>CPU</th><td>{html.escape(system_info.get('cpu', 'N/A'))}</td></tr>
-                    <tr><th>Memory</th><td>{html.escape(system_info.get('memory', 'N/A'))}</td></tr>
-                    <tr><th>Uptime</th><td>{html.escape(system_info.get('uptime', 'N/A'))}</td></tr>
-                    <tr><th>Last Boot</th><td>{html.escape(system_info.get('last_boot', 'N/A'))}</td></tr>
+                <table class="data-table">
+                    <tbody>
+                        <tr><th>Hostname</th><td>{html.escape(system_info.get('hostname', 'N/A'))}</td></tr>
+                        <tr><th>OS Version</th><td>{html.escape(system_info.get('os_version', 'N/A'))}</td></tr>
+                        <tr><th>Kernel</th><td>{html.escape(system_info.get('kernel', 'N/A'))}</td></tr>
+                        <tr><th>System Model</th><td>{html.escape(system_info.get('system_model', 'N/A'))}</td></tr>
+                        <tr><th>CPU</th><td>{html.escape(system_info.get('cpu', 'N/A'))}</td></tr>
+                        <tr><th>Memory</th><td>{html.escape(system_info.get('memory', 'N/A'))}</td></tr>
+                        <tr><th>Uptime</th><td>{html.escape(system_info.get('uptime', 'N/A'))}</td></tr>
+                        <tr><th>Last Boot</th><td>{html.escape(system_info.get('last_boot', 'N/A'))}</td></tr>
+                    </tbody>
                 </table>
             </div>
-            
+
             {graph_html}
 
             <div class="section">
@@ -1139,7 +1225,7 @@ class AIAnalyzer:
                     <tbody>{netdev_tx_rows}</tbody>
                 </table>
                 <h3>소켓 통계</h3>
-                <pre style="background:#eee; padding:10px; border-radius:4px;">{html.escape(chr(10).join(network_details.get('sockstat', [])))}</pre>
+                <pre style="background:#eee; padding:10px; border-radius:4px; word-wrap:break-word;">{html.escape(chr(10).join(network_details.get('sockstat', [])))}</pre>
                 <h3>네트워크 본딩</h3>
                 <table class="data-table">
                     <thead><tr><th>Device</th><th>Mode</th><th>Slaves</th></tr></thead>
@@ -1156,8 +1242,8 @@ class AIAnalyzer:
             <div class="section">
                 <h2>⚙️ 리소스 사용 현황</h2>
                 <h3>프로세스 요약</h3>
-                <table class="info-table">
-                    <tr><th>Total Processes</th><td>{process_stats.get('total', 'N/A')}</td></tr>
+                <table class="data-table">
+                    <tbody><tr><th>Total Processes</th><td>{process_stats.get('total', 'N/A')}</td></tr></tbody>
                 </table>
                 <h3>Top Users of CPU & MEM</h3>
                 <table class="data-table">
@@ -1176,53 +1262,76 @@ class AIAnalyzer:
                 </table>
                 <h3>Top 5 Processes (CPU)</h3>
                 <table class="data-table">
+                    <colgroup><col style="width:10%"><col style="width:15%"><col style="width:15%"><col style="width:60%"></colgroup>
                     <thead><tr><th>PID</th><th>User</th><th>CPU %</th><th>Command</th></tr></thead>
                     <tbody>{create_table_rows(process_stats.get('top_cpu', []), ['pid', 'user', 'cpu%', 'command'])}</tbody>
                 </table>
                 <h3>Top 5 Processes (Memory)</h3>
                 <table class="data-table">
+                    <colgroup><col style="width:10%"><col style="width:15%"><col style="width:15%"><col style="width:60%"></colgroup>
                     <thead><tr><th>PID</th><th>User</th><th>RSS (KiB)</th><th>Command</th></tr></thead>
                     <tbody>{create_table_rows(process_stats.get('top_mem', []), ['pid', 'user', 'rss', 'command'])}</tbody>
                 </table>
             </div>
             <div class="section">
-                <h2>🔧 실패한 서비스</h2>
-                <ul class="issue-list critical-list">{''.join(f"<li>{html.escape(service)}</li>" for service in failed_services) or "<li>실패한 서비스가 없습니다.</li>"}</ul>
+                <h2>🔧 실패한 서비스 ({len(failed_services)}개)</h2>
+                <table class="data-table">
+                    <colgroup><col style="width:100%"></colgroup>
+                    <thead><tr><th>상세 내용</th></tr></thead>
+                    <tbody>{failed_services_rows}</tbody>
+                </table>
             </div>
 
-            <!-- AI 분석 섹션 -->
-            <div class="section">
-                <h2>🚨 AI 분석: 심각한 이슈 ({len(critical_issues)}개)</h2>
-                <ul class="issue-list critical-list">{''.join(f"<li>{html.escape(issue)}</li>" for issue in critical_issues) or "<li>발견된 심각한 이슈가 없습니다.</li>"}</ul>
-            </div>
-            <div class="section">
-                <h2>⚠️ AI 분석: 경고 사항 ({len(warnings)}개)</h2>
-                <ul class="issue-list">{''.join(f"<li>{html.escape(warning)}</li>" for warning in warnings) or "<li>특별한 경고 사항이 없습니다.</li>"}</ul>
-            </div>
+            <!-- AI 분석 및 보안 뉴스 섹션 (순서 변경됨) -->
             <div class="section">
                 <h2>💡 AI 분석: 권장사항 ({len(recommendations)}개)</h2>
                 <table class="data-table">
-                    <thead><tr><th>우선순위</th><th>카테고리</th><th>문제점</th><th>해결 방안</th></tr></thead>
-                    <tbody>{create_table_rows(recommendations, ['priority', 'category', 'issue', 'solution'])}</tbody>
+                    <colgroup><col style="width:10%"><col style="width:15%"><col style="width:35%"><col style="width:40%"></colgroup>
+                    <thead><tr><th>우선순위</th><th>카테고리</th><th>문제점 💬</th><th>해결 방안</th></tr></thead>
+                    <tbody>{create_recommendation_rows(recommendations)}</tbody>
                 </table>
             </div>
+            
             <div class="section">
-                <h2>🤖 AI 종합 분석</h2>
-                <div class="ai-summary-card">
-                    <p><b>종합 상태:</b> <span class="ai-status">{status}</span> (건강도 점수: {score}/100)</p>
-                    <p><b>요약:</b> {summary}</p>
-                </div>
+                <h2>🚨 AI 분석: 심각한 이슈 ({len(critical_issues)}개)</h2>
+                <table class="data-table">
+                    <colgroup><col style="width:100%"></colgroup>
+                    <thead><tr><th>상세 내용</th></tr></thead>
+                    <tbody>{critical_issues_rows}</tbody>
+                </table>
             </div>
 
-            <!-- 보안 뉴스 섹션 -->
+            <div class="section">
+                <h2>⚠️ AI 분석: 경고 사항 ({len(warnings)}개)</h2>
+                <table class="data-table">
+                    <colgroup><col style="width:100%"></colgroup>
+                    <thead><tr><th>상세 내용</th></tr></thead>
+                    <tbody>{warnings_rows}</tbody>
+                </table>
+            </div>
+
+            <div class="section">
+                <h2>🤖 AI 종합 분석</h2>
+                <table class="data-table">
+                    <colgroup><col style="width:20%"><col style="width:80%"></colgroup>
+                    <tbody>
+                        <tr><th>종합 상태</th><td><span class="ai-status">{status}</span></td></tr>
+                        <tr><th>건강도 점수</th><td>{score}/100</td></tr>
+                        <tr><th>요약</th><td>{summary}</td></tr>
+                    </tbody>
+                </table>
+            </div>
+
             <div class="section">
                 <h2>🛡️ 보안 뉴스 (가장 중요한 CVE 최대 10개) <span style="font-size: 0.7em; font-weight: normal;">(🔥 Critical, ⚠️ Important)</span></h2>
                 <table class="data-table">
-                    <thead><tr><th>CVE 식별자</th><th>심각도</th><th>생성일</th><th>요약</th></tr></thead>
+                    <colgroup><col style="width:18%"><col style="width:10%"><col style="width:12%"><col style="width:60%"></colgroup>
+                    <thead><tr><th>CVE 식별자</th><th>심각도</th><th>생성일</th><th>위협 및 영향 요약</th></tr></thead>
                     <tbody>{create_security_news_rows(security_news)}</tbody>
                 </table>
                 <p style="font-size: 12px; text-align: center;">보안 정보에 대한 상세 내용은 <a href="https://access.redhat.com/security/security-updates/security-advisories" target="_blank">Red Hat Security Advisories</a> 사이트에서 확인하실 수 있습니다.</p>
             </div>
+
         </div>
         <footer>보고서 생성 시각: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</footer>
     </div>
