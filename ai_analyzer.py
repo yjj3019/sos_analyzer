@@ -66,35 +66,30 @@ class SosreportParser:
     
     def _parse_installed_packages(self) -> List[str]:
         """installed-rpms 파일에서 '패키지-버전-릴리즈' 전체 문자열을 파싱합니다."""
-        # [수정] 사용자가 요청한 새로운 rpm 경로 리스트로 변경
+        # --- 수정된 부분: 대상 파일 경로 변경 ---
         rpm_content = self._read_file([
-            'installed-rpms', 
-            'sos_commands/rpm/sh_-c_rpm_--nodigest_-qa_--qf_NAME_-_VERSION_-_RELEASE_._ARCH_INSTALLTIME_date_awk_-F_printf_-59s_s_n_1_2_sort_-V', 
-            'sos_commands/lvm2/vgdisplay_-vv_--config_global_metadata_read_only_1_--nolocking_--foreign', 
-            'sos_commands/rpm/sh_-c_rpm_--nodigest_-qa_--qf_-59_NVRA_INSTALLTIME_date_sort_-V'
+            'sos_commands/rpm/package-data'
         ])
+        # ------------------------------------
 
         if rpm_content == 'N/A' or not rpm_content.strip():
-            print("⚠️ 'installed-rpms' 파일을 찾을 수 없거나 내용이 비어 있습니다.")
+            print("⚠️ 'package-data' 파일을 찾을 수 없거나 내용이 비어 있습니다.")
             return []
         
         packages = []
-        # rpm 쿼리 결과가 복잡할 수 있으므로, 일반적인 패키지 이름 형식을 추출하도록 정규식 사용
-        package_pattern = re.compile(r'^([a-zA-Z0-9_.+-]+-\d+.*)')
+        # --- 수정된 부분: 새로운 파일 형식에 맞는 파싱 로직 ---
+        # package-data 파일은 일반적으로 한 줄에 하나의 패키지 정보가 나열됩니다.
         for line in rpm_content.split('\n'):
             line = line.strip()
-            if not line or line.startswith(('gpg-pubkey', 'warning:', 'error:')):
+            # 주석이나 빈 줄은 건너뜁니다.
+            if not line or line.startswith('#'):
                 continue
             
-            match = package_pattern.match(line)
-            if match:
-                packages.append(match.group(1))
-            else:
-                # 간단한 형식 (이름만 있는 경우)
-                parts = line.split()
-                if len(parts) > 0:
-                    packages.append(parts[0])
-
+            # 패키지명-버전-릴리즈.아키텍처 형식으로 가정합니다.
+            # 간단한 유효성 검사를 위해 정규식을 사용할 수 있습니다.
+            if re.match(r'^[a-zA-Z0-9_.+-]+-\d+', line):
+                 packages.append(line)
+        # ----------------------------------------------------
 
         unique_packages = sorted(list(set(packages)))
         print(f"✅ 설치된 패키지(버전 포함) 파싱 완료: {len(unique_packages)}개")
@@ -267,7 +262,6 @@ class SosreportParser:
         """NETDEV, SOCKSTAT, BONDING, ETHTOOL 정보를 파싱합니다."""
         details = {'netdev': [], 'sockstat': [], 'bonding': [], 'ethtool': {}}
 
-        # NETDEV
         netdev_content = self._read_file(['proc/net/dev'])
         for line in netdev_content.split('\n')[2:]:
             if ':' not in line: continue
@@ -283,11 +277,8 @@ class SosreportParser:
                     'tx_fifo': int(stat_values[12]), 'tx_colls': int(stat_values[13]), 'tx_carrier': int(stat_values[14]), 'tx_compressed': int(stat_values[15])
                 })
 
-        # SOCKSTAT
-        sockstat_content = self._read_file(['proc/net/sockstat'])
-        details['sockstat'] = sockstat_content.split('\n')
+        details['sockstat'] = self._read_file(['proc/net/sockstat']).split('\n')
 
-        # BONDING
         bonding_dir = self.base_path / 'proc/net/bonding'
         if bonding_dir.is_dir():
             for bond_file in bonding_dir.iterdir():
@@ -299,7 +290,6 @@ class SosreportParser:
                 bond_info['slaves'] = slaves
                 details['bonding'].append(bond_info)
         
-        # ETHTOOL
         ethtool_dir = self.base_path / 'sos_commands/networking'
         if ethtool_dir.is_dir():
             all_ifaces = [dev['iface'] for dev in details['netdev']]
@@ -353,11 +343,8 @@ class SosreportParser:
             except IndexError:
                 continue
 
-            if route_info['source'].startswith('127.'):
-                continue
-            
-            if route_info['destination'].lower() != 'default' and route_info['source'] == '-':
-                continue
+            if route_info['source'].startswith('127.'): continue
+            if route_info['destination'].lower() != 'default' and route_info['source'] == '-': continue
             
             routes.append(route_info)
         return routes
@@ -408,6 +395,25 @@ class SosreportParser:
         print("✅ sar 성능 데이터 파싱 완료.")
         return performance_data
 
+    def _parse_log_messages(self) -> List[str]:
+        """
+        var/log/messages 파일에서 오류 및 경고와 관련된 로그를 파싱합니다.
+        """
+        log_content = self._read_file(['var/log/messages', 'var/log/syslog'])
+        if log_content == 'N/A' or not log_content.strip():
+            print("⚠️ 'var/log/messages' 파일을 찾을 수 없거나 내용이 비어 있습니다.")
+            return []
+
+        keywords = ['error', 'failed', 'warning', 'critical']
+        relevant_lines = []
+        for line in log_content.split('\n'):
+            if any(keyword in line.lower() for keyword in keywords):
+                relevant_lines.append(line)
+
+        last_lines = relevant_lines[-500:]
+        print(f"✅ 'var/log/messages'에서 관련 로그 {len(last_lines)}줄을 추출했습니다.")
+        return last_lines
+
     def parse(self) -> Dict[str, Any]:
         """주요 sosreport 파일들을 파싱하여 딕셔너리로 반환합니다."""
         print("sosreport 데이터 파싱 시작...")
@@ -423,6 +429,7 @@ class SosreportParser:
             "failed_services": self._parse_failed_services(),
             "performance_data": self._parse_sar_data(),
             "installed_packages": self._parse_installed_packages(),
+            "log_messages": self._parse_log_messages(),
             "analysis_timestamp": datetime.now().isoformat()
         }
         print("✅ sosreport 데이터 파싱 완료.")
@@ -564,17 +571,22 @@ class AIAnalyzer:
         """AI 분석을 위한 프롬프트 생성"""
         print("AI 분석 프롬프트 생성 중...")
         
-        data_str = json.dumps({
+        log_summary = sosreport_data.get("log_messages", [])
+        
+        data_to_send = {
             "system_info": sosreport_data.get("system_info"),
             "storage": sosreport_data.get("storage"),
             "failed_services": sosreport_data.get("failed_services"),
             "process_stats_summary": {
                 "total": sosreport_data.get("process_stats", {}).get("total"),
                 "zombie_count": len(sosreport_data.get("process_stats", {}).get("zombie", [])),
-            }
-        }, indent=2, ensure_ascii=False)
+            },
+            "recent_log_warnings_and_errors": log_summary
+        }
 
-        prompt = f"""당신은 Red Hat Enterprise Linux 시스템 전문가입니다. 다음 sosreport 분석 데이터를 종합적으로 검토하고 전문적인 진단을 제공해주세요.
+        data_str = json.dumps(data_to_send, indent=2, ensure_ascii=False)
+
+        prompt = f"""당신은 Red Hat Enterprise Linux 시스템 전문가입니다. 다음 sosreport 분석 데이터와 시스템 로그를 종합적으로 검토하고 전문적인 진단을 제공해주세요.
 
 ## 분석 데이터
 ```json
@@ -582,20 +594,26 @@ class AIAnalyzer:
 ```
 
 ## 분석 요청
-위 데이터를 바탕으로 다음 JSON 형식에 맞춰 종합적인 시스템 분석을 제공해주세요.
+위 데이터, 특히 **`recent_log_warnings_and_errors`에 포함된 시스템 로그 메시지를 주의 깊게 분석**하여 다음 JSON 형식에 맞춰 종합적인 시스템 분석을 제공해주세요.
+
+- **`critical_issues` 또는 `warnings`**: 로그에서 발견된 구체적인 오류나 경고를 반드시 반영해야 합니다.
+- **`recommendations`**: 각 권장사항에 대해, 어떤 로그 메시지를 근거로 "문제점"을 진단했는지 `evidence_logs` 필드에 **정확한 로그 원문**을 포함시켜야 합니다. 근거가 된 로그가 없다면 빈 배열 `[]`로 남겨두세요.
 
 ```json
 {{
   "system_status": "정상|주의|위험",
   "overall_health_score": 100,
-  "critical_issues": ["발견된 심각한 문제들의 구체적인 설명"],
-  "warnings": ["주의가 필요한 사항들"],
+  "critical_issues": ["발견된 심각한 문제들의 구체적인 설명 (로그 분석 내용 포함)"],
+  "warnings": ["주의가 필요한 사항들 (로그 분석 내용 포함)"],
   "recommendations": [
     {{
       "priority": "높음|중간|낮음",
       "category": "성능|보안|안정성|유지보수",
       "issue": "문제점 설명",
-      "solution": "구체적인 해결 방안"
+      "solution": "구체적인 해결 방안",
+      "evidence_logs": [
+        "이 문제점을 진단하는 데 사용된 `recent_log_warnings_and_errors`의 실제 로그 메시지 원문"
+      ]
     }}
   ],
   "summary": "전체적인 시스템 상태와 주요 권장사항에 대한 종합 요약"
@@ -646,18 +664,19 @@ class AIAnalyzer:
         """
         print("최신 RHEL 보안 뉴스 조회 및 분석 시작...")
         
-        installed_packages_db = set(sos_data.get("installed_packages", []))
-        if not installed_packages_db:
+        installed_packages_full = sos_data.get("installed_packages", [])
+        if not installed_packages_full:
             reason = "sosreport에 설치된 패키지 정보(installed-rpms)가 없어 CVE 연관성을 분석할 수 없습니다."
             print(f"⚠️ {reason}")
             return [{"reason": reason}]
 
         try:
-            installed_package_names_only = set(re.sub(r'-[\d.:].*', '', pkg) for pkg in installed_packages_db)
+            installed_packages_map = {re.sub(r'-[\d.:].*', '', pkg): pkg for pkg in installed_packages_full}
+            installed_package_names_only = set(installed_packages_map.keys())
             kernel_version = sos_data.get("system_info", {}).get("kernel", "N/A")
 
             print(f"분석 대상 시스템 커널 버전: {kernel_version}")
-            print(f"분석 대상 시스템의 설치된 패키지 {len(installed_packages_db)}개를 DB화하여 참고합니다.")
+            print(f"분석 대상 시스템의 설치된 패키지 {len(installed_packages_full)}개를 DB화하여 참고합니다.")
 
             api_url = "https://access.redhat.com/hydra/rest/securitydata/cve.json"
             print(f"Red Hat CVE API 호출: {api_url}")
@@ -672,7 +691,9 @@ class AIAnalyzer:
             now = datetime.now()
             start_date = now - timedelta(days=180)
             
-            system_relevant_cves = []
+            package_cve_map = {}
+            severity_order = {"critical": 2, "important": 1, "moderate": 0, "low": -1}
+
             for cve in all_cves:
                 public_date_str = cve.get('public_date')
                 if not public_date_str: continue
@@ -681,28 +702,42 @@ class AIAnalyzer:
                     cve_date = datetime.fromisoformat(public_date_str.replace('Z', '+00:00')).replace(tzinfo=None)
                 except ValueError:
                     continue
+                
+                severity_value = cve.get('severity')
+                severity = severity_value.lower() if isinstance(severity_value, str) else 'low'
 
-                if not (start_date <= cve_date <= now and isinstance(cve.get('severity'), str) and cve.get('severity').lower() in ["critical", "important"]):
+                if not (start_date <= cve_date <= now and severity in ["critical", "important"]):
                     continue
                 
                 cve_affected_packages = cve.get('affected_packages', [])
-                if any(re.match(r'^([a-zA-Z0-9_.+-]+)-', pkg_str) and re.match(r'^([a-zA-Z0-9_.+-]+)-', pkg_str).group(1) in installed_package_names_only for pkg_str in cve_affected_packages):
-                    system_relevant_cves.append(cve)
+                for pkg_str in cve_affected_packages:
+                    pkg_name_match = re.match(r'^([a-zA-Z0-9_.+-]+)-', pkg_str)
+                    if pkg_name_match:
+                        pkg_name = pkg_name_match.group(1)
+                        if pkg_name in installed_package_names_only:
+                            current_severity = severity_order.get(severity, -1)
+                            existing_cve = package_cve_map.get(pkg_name)
+                            
+                            if not existing_cve or current_severity > severity_order.get(existing_cve.get('severity', 'low').lower(), -1):
+                                cve['matched_package'] = installed_packages_map[pkg_name]
+                                package_cve_map[pkg_name] = cve
+            
+            system_relevant_cves = list(package_cve_map.values())
 
             if not system_relevant_cves:
                 reason = "시스템에 설치된 패키지에 직접적인 영향을 주는 최신 보안 뉴스가 없습니다."
                 print(reason)
                 return [{"reason": reason}]
 
-            print(f"시스템 관련 CVE {len(system_relevant_cves)}개를 1차 선별했습니다.")
+            print(f"시스템 관련 CVE {len(system_relevant_cves)}개를 1차 선별했습니다. (패키지당 1개)")
             
             cve_identifiers = [cve['CVE'] for cve in system_relevant_cves]
-            packages_str = "\n- ".join(list(installed_packages_db)[:50]) + ("..." if len(installed_packages_db) > 50 else "")
+            packages_str = "\n- ".join(list(installed_packages_full)[:50]) + ("..." if len(installed_packages_full) > 50 else "")
 
             selection_prompt = f"""
 [시스템 안내]
 당신은 Red Hat Enterprise Linux(RHEL)를 전문으로 다루는 '시니어 보안 위협 분석가'입니다.
-당신의 임무는 주어진 RHEL 관련 보안 취약점 목록을 분석하여, 특정 시스템에 가장 시급하고 중요한 Top 10을 선별하고, 그 선별 이유를 명확히 기록하는 것입니다.
+당신의 임무는 주어진 RHEL 관련 보안 취약점 목록을 분석하여, 특정 시스템에 가장 시급하고 중요한 CVE를 **최대 10개**까지 선정하고, 그 선별 이유를 명확히 기록하는 것입니다.
 선별 과정에서 필요하다면 **Web Search**를 활성화하여 최신 정보를 검색하고 판단에 반영하십시오.
 
 [분석 대상 시스템 정보]
@@ -719,7 +754,7 @@ class AIAnalyzer:
 분석 대상 CVE 목록 (시스템 관련성 확인됨): {', '.join(cve_identifiers)}
 
 [출력 지시]
-위 선별 기준을 종합적으로 적용하여 선정한 Top 10 CVE에 대한 정보를 아래 JSON 형식에 맞춰 **오직 JSON 객체만** 출력하십시오.
+위 선별 기준을 종합적으로 적용하여 선정한 **최대 10개**의 CVE에 대한 정보를 아래 JSON 형식에 맞춰 **오직 JSON 객체만** 출력하십시오.
 - `cve_id`: **반드시 [입력 데이터]에 존재하는 CVE ID 중에서만** 선택해야 합니다.
 - `selection_reason`: 왜 이 CVE를 선택했는지 선별 기준(특히 웹 검색을 통해 파악한 최신 동향 및 실제 위협)에 근거하여 **한국어로 명확하고 간결하게** 기술해야 합니다.
 
@@ -737,35 +772,41 @@ class AIAnalyzer:
             
             selection_result = self.perform_ai_analysis(selection_prompt, is_news_request=True)
             
-            if not (isinstance(selection_result, dict) and 'cve_selection' in selection_result and selection_result['cve_selection']):
-                print("⚠️ LLM이 중요 CVE를 선정하지 못했습니다.")
-                return [{"reason": "AI가 분석 대상 CVE 목록에서 중요 CVE를 선정하지 못했습니다."}]
-
-            llm_log_path = self.output_dir / "llm_security_news.log"
-            selected_cves_from_llm = selection_result['cve_selection']
-            
-            original_cves_map = {cve['CVE']: cve for cve in system_relevant_cves}
-            
             top_cves_data = []
-            with open(llm_log_path, 'a', encoding='utf-8') as f:
-                f.write("\n\n--- CVE SELECTION & VALIDATION ---\n")
-                for item in selected_cves_from_llm:
-                    cve_id = item.get('cve_id')
-                    reason = item.get('selection_reason', 'No reason provided.')
-                    
-                    if cve_id and cve_id in original_cves_map:
-                        log_entry = f"- [VALID] {cve_id}: {reason}\n"
-                        f.write(log_entry)
-                        print(f"📝 로그 기록 (유효): {cve_id} 선별 이유")
-                        top_cves_data.append(original_cves_map[cve_id])
-                    else:
-                        log_entry = f"- [INVALID/HALLUCINATED] ID: {cve_id}, Reason: {reason}\n"
-                        f.write(log_entry)
-                        print(f"⚠️ 경고: AI가 생성한 유효하지 않은 CVE ID({cve_id})를 무시합니다.")
-
+            if isinstance(selection_result, dict) and 'cve_selection' in selection_result and selection_result['cve_selection']:
+                llm_log_path = self.output_dir / "llm_security_news.log"
+                selected_cves_from_llm = selection_result['cve_selection']
+                original_cves_map = {cve['CVE']: cve for cve in system_relevant_cves}
+                
+                with open(llm_log_path, 'a', encoding='utf-8') as f:
+                    f.write("\n\n--- CVE SELECTION & VALIDATION ---\n")
+                    for item in selected_cves_from_llm:
+                        cve_id = item.get('cve_id')
+                        reason = item.get('selection_reason', 'No reason provided.')
+                        
+                        if cve_id and cve_id in original_cves_map:
+                            log_entry = f"- [VALID] {cve_id}: {reason}\n"
+                            f.write(log_entry)
+                            print(f"📝 로그 기록 (유효): {cve_id} 선별 이유")
+                            top_cves_data.append(original_cves_map[cve_id])
+                        else:
+                            log_entry = f"- [INVALID/HALLUCINATED] ID: {cve_id}, Reason: {reason}\n"
+                            f.write(log_entry)
+                            print(f"⚠️ 경고: AI가 생성한 유효하지 않은 CVE ID({cve_id})를 무시합니다.")
+            
             if not top_cves_data:
-                print("⚠️ AI가 선정한 유효한 CVE가 없습니다.")
-                return [{"reason": "AI가 유효한 CVE를 선정하지 못했습니다."}]
+                print("⚠️ LLM이 중요 CVE를 선정하지 못했습니다. 수동으로 상위 CVE를 선택합니다.")
+                top_cves_data = sorted(system_relevant_cves, key=lambda x: (severity_order.get(x.get('severity', 'low').lower(), -1), x.get('public_date')), reverse=True)[:10]
+
+            if len(top_cves_data) < 10:
+                print(f"AI가 {len(top_cves_data)}개의 CVE만 선정했습니다. 목록을 보충합니다.")
+                selected_cve_ids = {cve['CVE'] for cve in top_cves_data}
+                remaining_cves = [cve for cve in system_relevant_cves if cve['CVE'] not in selected_cve_ids]
+                
+                sorted_remaining = sorted(remaining_cves, key=lambda x: (severity_order.get(x.get('severity', 'low').lower(), -1), x.get('public_date')), reverse=True)
+                
+                needed = 10 - len(top_cves_data)
+                top_cves_data.extend(sorted_remaining[:needed])
 
             processing_data = [{"cve_id": cve['CVE'], "description": cve.get('bugzilla_description', '요약 정보 없음')} for cve in top_cves_data]
 
@@ -814,13 +855,15 @@ class AIAnalyzer:
                         print(f"✅ 보안 뉴스 처리 완료: {cve_id}")
             else:
                 print("⚠️ LLM의 번역 처리에 실패했습니다. 원본 데이터로 보고서를 생성합니다.")
-                return top_cves_data
+                final_cves = top_cves_data
 
             print("✅ 보안 뉴스 조회 및 처리 완료.")
             return final_cves
 
         except Exception as e:
             print(f"❌ 보안 뉴스 조회 중 심각한 오류 발생: {e}")
+            import traceback
+            traceback.print_exc()
             return [{"reason": f"보안 뉴스 조회 중 오류가 발생했습니다: {e}"}]
 
     def create_performance_graphs(self, perf_data: Dict[str, List[Dict[str, Any]]]) -> Dict[str, str]:
@@ -901,59 +944,76 @@ class AIAnalyzer:
         warnings = analysis_result.get('warnings', [])
         recommendations = analysis_result.get('recommendations', [])
         
-        system_info = sos_data.get('system_info', {})
-        ip4_details = sos_data.get('ip4_details', [])
-        network_details = sos_data.get('network_details', {})
-        storage_info = sos_data.get('storage', [])
-        process_stats = sos_data.get('process_stats', {})
-        failed_services = sos_data.get('failed_services', [])
         security_news = sos_data.get('security_news', [])
 
         status_colors = {"정상": "#28a745", "주의": "#ffc107", "위험": "#dc3545"}
         status_color = status_colors.get(status, "#6c757d")
 
-        ip4_details_rows = ""
-        if not ip4_details:
-            ip4_details_rows = "<tr><td colspan='6' style='text-align:center;'>데이터 없음</td></tr>"
-        else:
-            for item in ip4_details:
-                state_val = item.get('state', 'unknown').lower()
-                if 'up' in state_val:
-                    state_html = '<td style="color: green; font-weight: bold;">🔛 UP</td>'
-                elif 'down' in state_val:
-                    state_html = '<td style="color: grey;">📴 DOWN</td>'
-                else:
-                    state_html = f"<td>❓ {html.escape(state_val.upper())}</td>"
-                
-                ip4_details_rows += f"""
+        def create_recommendations_rows(recommendations_list):
+            rows = ""
+            if not recommendations_list:
+                return "<tr><td colspan='4' style='text-align:center;'>데이터 없음</td></tr>"
+            
+            for item in recommendations_list:
+                issue_text = html.escape(item.get('issue', 'N/A'))
+                solution_text = html.escape(item.get('solution', 'N/A'))
+                evidence_logs = item.get('evidence_logs', [])
+
+                issue_class = ' class="long-text"' if len(issue_text) > 100 else ''
+                solution_class = ' class="long-text"' if len(solution_text) > 150 else ''
+
+                issue_html = issue_text
+                if evidence_logs:
+                    log_html = "<br>".join([html.escape(log) for log in evidence_logs])
+                    issue_html = f"""
+                    <div style="display: flex; align-items: center; justify-content: space-between;">
+                        <span>{issue_text}</span>
+                        <div class="tooltip">📄
+                            <span class="tooltiptext wide">{log_html}</span>
+                        </div>
+                    </div>
+                    """
+
+                rows += f"""
                     <tr>
-                        <td>{html.escape(item.get('iface', 'N/A'))}</td>
-                        <td>{html.escape(item.get('master', 'N/A'))}</td>
-                        <td>{html.escape(item.get('mac', 'N/A'))}</td>
-                        <td>{html.escape(item.get('mtu', 'N/A'))}</td>
-                        {state_html}
-                        <td>{html.escape(item.get('ipv4', 'N/A'))}</td>
+                        <td>{html.escape(item.get('priority', 'N/A'))}</td>
+                        <td>{html.escape(item.get('category', 'N/A'))}</td>
+                        <td{issue_class}>{issue_html}</td>
+                        <td{solution_class}>{solution_text.replace(chr(10), '<br>')}</td>
                     </tr>
                 """
+            return rows
 
-        def create_table_rows(data_list, headers):
+        def create_security_news_rows(news_list):
             rows = ""
-            if not data_list:
-                return f"<tr><td colspan='{len(headers)}' style='text-align:center;'>데이터 없음</td></tr>"
+            if not news_list:
+                return "<tr><td colspan='4' style='text-align:center;'>데이터 없음</td></tr>"
             
-            if isinstance(data_list, list) and len(data_list) == 1 and 'reason' in data_list[0]:
-                reason_text = html.escape(data_list[0]['reason'])
-                return f"<tr><td colspan='{len(headers)}' style='text-align:center;'>{reason_text}</td></tr>"
+            if isinstance(news_list, list) and len(news_list) == 1 and 'reason' in news_list[0]:
+                reason_text = html.escape(news_list[0]['reason'])
+                return f"<tr><td colspan='4' style='text-align:center;'>{reason_text}</td></tr>"
 
-            for item in data_list:
-                rows += "<tr>"
-                for header in headers:
-                    if header == 'CVE' and isinstance(item.get(header), str):
-                        cve_id = html.escape(item.get(header))
-                        rows += f'<td><a href="https://access.redhat.com/security/cve/{cve_id}" target="_blank">{cve_id}</a></td>'
-                    else:
-                        rows += f"<td>{html.escape(str(item.get(header, 'N/A')))}</td>"
-                rows += "</tr>"
+            for item in news_list:
+                cve_id = html.escape(item.get('CVE', 'N/A'))
+                severity = item.get('severity', '').lower()
+                matched_package = html.escape(item.get('matched_package', 'N/A'))
+
+                severity_html = ''
+                if severity == 'critical':
+                    severity_html = f'<td style="text-align:center;"><div class="tooltip" style="font-size: 1.5em;">🔥<span class="tooltiptext">패키지: {matched_package}</span></div></td>'
+                elif severity == 'important':
+                    severity_html = f'<td style="text-align:center;"><div class="tooltip" style="font-size: 1.5em;">⚠️<span class="tooltiptext">패키지: {matched_package}</span></div></td>'
+                else:
+                    severity_html = f"<td>{html.escape(item.get('severity', 'N/A'))}</td>"
+
+                rows += f"""
+                    <tr>
+                        <td><a href="https://access.redhat.com/security/cve/{cve_id}" target="_blank">{cve_id}</a></td>
+                        {severity_html}
+                        <td>{html.escape(item.get('public_date', 'N/A'))}</td>
+                        <td>{html.escape(item.get('bugzilla_description', 'N/A'))}</td>
+                    </tr>
+                """
             return rows
 
         graph_html = ""
@@ -964,23 +1024,6 @@ class AIAnalyzer:
             if 'network_graph' in graphs: graph_html += f'<h3>네트워크 트래픽</h3><img src="data:image/png;base64,{graphs["network_graph"]}" alt="Network Graph" style="width:100%;">'
             graph_html += '</div>'
         
-        netdev_rx_rows = ""
-        netdev_tx_rows = ""
-        netdev_data = network_details.get('netdev', [])
-        for dev in netdev_data:
-            rx_packets = dev.get('rx_packets', 0)
-            rx_drop = dev.get('rx_drop', 0)
-            rx_multicast = dev.get('rx_multicast', 0)
-            rx_drop_pct = f"({int(rx_drop * 100 / rx_packets)}%)" if rx_packets > 0 else ""
-            rx_multicast_pct = f"({int(rx_multicast * 100 / rx_packets)}%)" if rx_packets > 0 else ""
-            netdev_rx_rows += f"<tr><td>{html.escape(dev['iface'])}</td><td>{dev['rx_bytes']:,}</td><td>{dev['rx_packets']:,}</td><td>{dev['rx_errs']}</td><td>{dev['rx_drop']} {rx_drop_pct}</td><td>{dev['rx_multicast']} {rx_multicast_pct}</td></tr>"
-            netdev_tx_rows += f"<tr><td>{html.escape(dev['iface'])}</td><td>{dev['tx_bytes']:,}</td><td>{dev['tx_packets']:,}</td><td>{dev['tx_errs']}</td><td>{dev['tx_drop']}</td><td>{dev['tx_colls']}</td><td>{dev['tx_carrier']}</td></tr>"
-
-        ethtool_rows = ""
-        ethtool_data = network_details.get('ethtool', {})
-        for iface, data in ethtool_data.items():
-            ethtool_rows += f"<tr><td>{html.escape(iface)}</td><td>{html.escape(data.get('link', 'N/A'))}</td><td>{html.escape(data.get('speed', 'N/A'))}</td><td>{html.escape(data.get('driver', 'N/A'))}</td><td>{html.escape(data.get('firmware', 'N/A'))}</td></tr>"
-
         html_template = f"""
 <!DOCTYPE html>
 <html lang="ko">
@@ -1006,107 +1049,34 @@ class AIAnalyzer:
         .ai-summary-card {{ background-color: #e9ecef; padding: 20px; border-radius: 8px; }}
         .ai-status {{ font-size: 1.5em; font-weight: bold; color: {status_color}; }}
         footer {{ text-align: center; padding: 15px; font-size: 12px; color: #888; background-color: #f4f7f9; }}
+        
+        .tooltip {{ position: relative; display: inline-block; cursor: pointer; }}
+        .tooltip .tooltiptext {{
+            visibility: hidden; width: 220px; background-color: #555; color: #fff; text-align: center;
+            border-radius: 6px; padding: 5px 0; position: absolute; z-index: 1; bottom: 125%;
+            left: 50%; margin-left: -110px; opacity: 0; transition: opacity 0.3s; font-size: 12px;
+        }}
+        .tooltip .tooltiptext::after {{
+            content: ""; position: absolute; top: 100%; left: 50%; margin-left: -5px;
+            border-width: 5px; border-style: solid; border-color: #555 transparent transparent transparent;
+        }}
+        .tooltip:hover .tooltiptext {{ visibility: visible; opacity: 1; }}
+        .tooltip .tooltiptext.wide {{
+            width: 400px;
+            margin-left: -200px;
+            text-align: left;
+            padding: 10px;
+            white-space: pre-wrap;
+        }}
+        .long-text {{
+            font-size: 0.9em;
+        }}
     </style>
 </head>
 <body>
     <div class="container">
         <header><h1>S-Core System Report</h1></header>
         <div class="content">
-            <div class="section">
-                <h2>ℹ️ 시스템 요약</h2>
-                <table class="info-table">
-                    <tr><th>Hostname</th><td>{html.escape(system_info.get('hostname', 'N/A'))}</td></tr>
-                    <tr><th>OS Version</th><td>{html.escape(system_info.get('os_version', 'N/A'))}</td></tr>
-                    <tr><th>Kernel</th><td>{html.escape(system_info.get('kernel', 'N/A'))}</td></tr>
-                    <tr><th>System Model</th><td>{html.escape(system_info.get('system_model', 'N/A'))}</td></tr>
-                    <tr><th>CPU</th><td>{html.escape(system_info.get('cpu', 'N/A'))}</td></tr>
-                    <tr><th>Memory</th><td>{html.escape(system_info.get('memory', 'N/A'))}</td></tr>
-                    <tr><th>Uptime</th><td>{html.escape(system_info.get('uptime', 'N/A'))}</td></tr>
-                    <tr><th>Last Boot</th><td>{html.escape(system_info.get('last_boot', 'N/A'))}</td></tr>
-                </table>
-            </div>
-            
-            {graph_html}
-
-            <div class="section">
-                <h2>🌐 네트워크 정보</h2>
-                <h3>IP4 상세 정보</h3>
-                <table class="data-table">
-                    <thead><tr><th>Interface</th><th>Master IF</th><th>MAC Address</th><th>MTU</th><th>State</th><th>IPv4 Address</th></tr></thead>
-                    <tbody>{ip4_details_rows}</tbody>
-                </table>
-                <h3>라우팅 테이블</h3>
-                <table class="data-table">
-                    <thead><tr><th>Destination</th><th>Gateway</th><th>Device</th><th>Source</th></tr></thead>
-                    <tbody>{create_table_rows(system_info.get('routing_table', []), ['destination', 'gateway', 'device', 'source'])}</tbody>
-                </table>
-                <h3>ETHTOOL 상태</h3>
-                <table class="data-table">
-                    <thead><tr><th>Interface</th><th>Link</th><th>Speed</th><th>Driver</th><th>Firmware</th></tr></thead>
-                    <tbody>{ethtool_rows}</tbody>
-                </table>
-                <h3>NETDEV 통계 (Receive)</h3>
-                <table class="data-table">
-                    <thead><tr><th>Interface</th><th>RxBytes</th><th>RxPackets</th><th>RxErrs</th><th>RxDrop</th><th>RxMulticast</th></tr></thead>
-                    <tbody>{netdev_rx_rows}</tbody>
-                </table>
-                <h3>NETDEV 통계 (Transmit)</h3>
-                <table class="data-table">
-                    <thead><tr><th>Interface</th><th>TxBytes</th><th>TxPackets</th><th>TxErrs</th><th>TxDrop</th><th>TxColls</th><th>TxCarrier</th></tr></thead>
-                    <tbody>{netdev_tx_rows}</tbody>
-                </table>
-                <h3>소켓 통계</h3>
-                <pre style="background:#eee; padding:10px; border-radius:4px;">{html.escape(chr(10).join(network_details.get('sockstat', [])))}</pre>
-                <h3>네트워크 본딩</h3>
-                <table class="data-table">
-                    <thead><tr><th>Device</th><th>Mode</th><th>Slaves</th></tr></thead>
-                    <tbody>{create_table_rows(network_details.get('bonding', []), ['device', 'mode', 'slaves'])}</tbody>
-                </table>
-            </div>
-            <div class="section">
-                <h2>💾 스토리지 및 파일 시스템</h2>
-                <table class="data-table">
-                    <thead><tr><th>Filesystem</th><th>Size</th><th>Used</th><th>Avail</th><th>Use%</th><th>Mounted on</th></tr></thead>
-                    <tbody>{create_table_rows(storage_info, ['filesystem', 'size', 'used', 'avail', 'use%', 'mounted_on'])}</tbody>
-                </table>
-            </div>
-            <div class="section">
-                <h2>⚙️ 리소스 사용 현황</h2>
-                <h3>프로세스 요약</h3>
-                <table class="info-table">
-                    <tr><th>Total Processes</th><td>{process_stats.get('total', 'N/A')}</td></tr>
-                </table>
-                <h3>Top Users of CPU & MEM</h3>
-                <table class="data-table">
-                    <thead><tr><th>USER</th><th>%CPU</th><th>%MEM</th><th>RSS</th></tr></thead>
-                    <tbody>{create_table_rows(process_stats.get('by_user', []), ['user', 'cpu%', 'mem%', 'rss'])}</tbody>
-                </table>
-                <h3>Uninterruptible Sleep Processes ({len(process_stats.get('uninterruptible', []))})</h3>
-                <table class="data-table">
-                    <thead><tr><th>USER</th><th>PID</th><th>%CPU</th><th>%MEM</th><th>RSS</th><th>STAT</th><th>START</th><th>TIME</th><th>COMMAND</th></tr></thead>
-                    <tbody>{create_table_rows(process_stats.get('uninterruptible', []), ['user', 'pid', 'cpu%', 'mem%', 'rss', 'stat', 'start', 'time', 'command'])}</tbody>
-                </table>
-                <h3>Zombie Processes ({len(process_stats.get('zombie', []))})</h3>
-                <table class="data-table">
-                    <thead><tr><th>USER</th><th>PID</th><th>%CPU</th><th>%MEM</th><th>RSS</th><th>STAT</th><th>START</th><th>TIME</th><th>COMMAND</th></tr></thead>
-                    <tbody>{create_table_rows(process_stats.get('zombie', []), ['user', 'pid', 'cpu%', 'mem%', 'rss', 'stat', 'start', 'time', 'command'])}</tbody>
-                </table>
-                <h3>Top 5 Processes (CPU)</h3>
-                <table class="data-table">
-                    <thead><tr><th>PID</th><th>User</th><th>CPU %</th><th>Command</th></tr></thead>
-                    <tbody>{create_table_rows(process_stats.get('top_cpu', []), ['pid', 'user', 'cpu%', 'command'])}</tbody>
-                </table>
-                <h3>Top 5 Processes (Memory)</h3>
-                <table class="data-table">
-                    <thead><tr><th>PID</th><th>User</th><th>RSS (KiB)</th><th>Command</th></tr></thead>
-                    <tbody>{create_table_rows(process_stats.get('top_mem', []), ['pid', 'user', 'rss', 'command'])}</tbody>
-                </table>
-            </div>
-            <div class="section">
-                <h2>🔧 실패한 서비스</h2>
-                <ul class="issue-list critical-list">{''.join(f"<li>{html.escape(service)}</li>" for service in failed_services) or "<li>실패한 서비스가 없습니다.</li>"}</ul>
-            </div>
-
             <!-- AI 분석 섹션 -->
             <div class="section">
                 <h2>🚨 AI 분석: 심각한 이슈 ({len(critical_issues)}개)</h2>
@@ -1120,7 +1090,7 @@ class AIAnalyzer:
                 <h2>💡 AI 분석: 권장사항 ({len(recommendations)}개)</h2>
                 <table class="data-table">
                     <thead><tr><th>우선순위</th><th>카테고리</th><th>문제점</th><th>해결 방안</th></tr></thead>
-                    <tbody>{create_table_rows(recommendations, ['priority', 'category', 'issue', 'solution'])}</tbody>
+                    <tbody>{create_recommendations_rows(recommendations)}</tbody>
                 </table>
             </div>
             <div class="section">
@@ -1133,10 +1103,10 @@ class AIAnalyzer:
 
             <!-- 보안 뉴스 섹션 -->
             <div class="section">
-                <h2>🛡️ 보안 뉴스 (가장 중요한 10개)</h2>
+                <h2>🛡️ 보안 뉴스 (가장 중요한 CVE 최대 10개) <span style="font-size: 0.7em; font-weight: normal;">(🔥 Critical, ⚠️ Important)</span></h2>
                 <table class="data-table">
                     <thead><tr><th>CVE 식별자</th><th>심각도</th><th>생성일</th><th>요약</th></tr></thead>
-                    <tbody>{create_table_rows(security_news, ['CVE', 'severity', 'public_date', 'bugzilla_description'])}</tbody>
+                    <tbody>{create_security_news_rows(security_news)}</tbody>
                 </table>
                 <p style="font-size: 12px; text-align: center;">보안 정보에 대한 상세 내용은 <a href="https://access.redhat.com/security/security-updates/security-advisories" target="_blank">Red Hat Security Advisories</a> 사이트에서 확인하실 수 있습니다.</p>
             </div>
