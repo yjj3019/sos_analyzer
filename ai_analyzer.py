@@ -606,7 +606,7 @@ class AIAnalyzer:
             raise ValueError(error_message)
 
     def fetch_security_news(self) -> List[Dict[str, str]]:
-        """RHEL 관련 최신 보안 뉴스를 가져옵니다."""
+        """RHEL 관련 최신 보안 뉴스를 전문적인 기준으로 선별하여 가져옵니다."""
         print("최신 RHEL 보안 뉴스 조회 중 (Red Hat API 직접 호출)...")
         try:
             # 1. Red Hat의 공식 CVE 데이터 API를 직접 호출
@@ -648,53 +648,43 @@ class AIAnalyzer:
                 print("분석할 최신 보안 뉴스가 없습니다.")
                 return []
             
-            # 3. [1단계 AI 분석] 가장 중요한 CVE 5개 선정
+            # 3. [1단계 AI 분석] 가장 중요한 CVE 5개 선정 (개선된 프롬프트)
             cve_identifiers = [cve['CVE'] for cve in filtered_cves]
-            selection_prompt = f"""[시스템 안내]  
-당신은 보안 전문가이자 리눅스 엔지니어입니다.  
-다음 조건에 맞춰 최근 6개월 내 전 세계적으로 이슈된 보안 취약점 중 Red Hat Enterprise Linux(RHEL) 관련 내용을 조사하고 요약하세요.  
+            selection_prompt = f"""
+[시스템 안내]
+당신은 Red Hat Enterprise Linux(RHEL)를 사용하는 기업의 보안을 책임지는 '시니어 보안 위협 분석가'입니다.
+당신의 임무는 최근 6개월 내 발표된 RHEL 관련 보안 취약점 목록을 분석하여, 시스템 관리자가 즉시 주목해야 할 **가장 영향력 있는 Top 5**를 선별하고 그 핵심 내용을 보고하는 것입니다.
 
-[조사 및 선별 조건]  
-1. 출처는 반드시 Red Hat 공식 보안 자료(예: Red Hat Security Advisories, Red Hat CVE 데이터베이스) 기반으로 하며, RHEL 외 다른 리눅스 배포판(Ubuntu, Debian 등)은 제외합니다.  
-2. 중요도는 Important 또는 Critical 등급의 취약점에 한정하며, 우선순위는 "kernel, glibc, openssl, openssh, systemd" 관련 취약점을 조사하여 이중에서 사람들이 가장 많이 찾는 보안이슈 5개를 선정합니다. 
-    - 보안 이슈 조사 과정에서 아래의 [참고 사이트]에 정보가 존재 한다면 우선으로 처리해줘.
-        [참고 사이트]
-        - https://knvd.krcert.or.kr/
-        - https://asec.ahnlab.com/ko/category/vulnerability-ko/
-        - https://www.boho.or.kr/
-        - https://boannews.com/
+[선별 기준]
+다음 기준을 종합적으로 고려하여 가장 중요한 취약점 5개를 선정하십시오. Web Search 기능을 적극 활용하여 각 CVE의 실제 위험도를 판단해야 합니다.
 
-3. 선별된 취약점은 Red Hat 공식 사이트 및 신뢰할 수 있는 보안 사이트(cve.mitre.org, nvd.nist.gov)에서 검증 후, RHEL 환경에서의 영향과 대응 현황을 중심으로 간략히 요약합니다.  
-   - 기술적 세부사항보다는 보안 커뮤니티 논의, 주요 기업 반응, 패치 상태 위주로 작성합니다.  
-4. 필요시 "Web Search" 기능을 활성화하여 최신 정보와 추가 의견을 확보하세요.  
+1.  **실제 공격 가능성(Exploitability):** 공개된 공격 코드가 존재하거나, 이미 실제 공격(In-the-wild)에 악용되고 있는 취약점을 최우선으로 고려합니다.
+2.  **영향받는 핵심 컴포넌트:** `kernel`, `glibc`, `openssl`, `openssh`, `systemd` 등 시스템의 근간을 이루는 핵심 컴포넌트의 취약점을 우선적으로 다룹니다.
+3.  **보안 커뮤니티 및 언론의 주목도:** 국내외 보안 커뮤니티, 블로그, 뉴스에서 활발하게 논의되고 있는 취약점을 중요하게 평가합니다. 아래 한국 주요 보안 사이트들을 반드시 참고하여 국내 동향을 반영하십시오.
+    * KRCERT 보안공지 (krcert.or.kr)
+    * AhnLab ASEC 블로그 (asec.ahnlab.com)
+    * 보안뉴스 (boannews.com)
+4.  **공격의 용이성:** 원격 코드 실행(RCE)과 같이 인증 없이 원격에서 쉽게 악용될 수 있는 취약점에 높은 가중치를 부여합니다.
 
-[출력 형식 예시]  
-- CVE 번호 및 취약점명  
-- 영향받는 컴포넌트 및 RHEL 버전  
-- 취약점 중요도  
-- 보안 커뮤니티 및 기업 반응 요약  
-- 현재 패치 및 대응 현황  
+[입력 데이터]
+분석 대상 RHEL 관련 CVE 목록: {', '.join(cve_identifiers)}
 
-현재 날짜: 준수
-
-위 조건을 엄격히 준수하여 조사 및 요약을 시작하세요.
-
-CVE 목록: {', '.join(cve_identifiers)}
-응답은 반드시 다음 JSON 형식이어야 해. 가장 중요한 5개의 CVE에 대한 분석만 객체로 포함해야 해.
+[출력 지시]
+위 선별 기준에 따라 선정한 Top 5 CVE에 대한 정보를 아래 JSON 형식에 맞춰 **오직 JSON 객체만** 출력하십시오. 'summary'에는 RHEL 환경에서의 영향, 패치 현황, 커뮤니티 반응을 중심으로 간결하게 요약하고, 'red_hat_advisory'에는 관련 Red Hat 보안 권고 링크나 ID를 포함하십시오.
 
 ```json
 {{
   "cve_trends": [
     {{
       "cve_id": "CVE-XXXX-XXXX",
-      "component": "kernel",
-      "summary": "설명 최소화 (논의, 반응, 패치 현황 중심)",
-      "red_hat_advisory": "RHSA-XXXX:XXXX 또는 해당 링크"
+      "component": "영향받는 핵심 컴포넌트 (예: kernel)",
+      "summary": "RHEL 환경에서의 영향, 패치 현황, 커뮤니티 반응 중심의 요약",
+      "red_hat_advisory": "RHSA-XXXX:XXXX 또는 관련 링크"
     }}
   ]
 }}
 ```
-다른 설명 없이 순수한 JSON 객체만 출력해야 합니다."""
+"""
             
             selection_result = self.perform_ai_analysis(selection_prompt, is_news_request=True)
             
@@ -717,24 +707,30 @@ CVE 목록: {', '.join(cve_identifiers)}
                     "trend": trends_map.get(cve['CVE'], '')
                 })
 
-            processing_prompt = f"""다음 JSON 데이터에 포함된 각 CVE에 대해, 'description'을 한국어로 번역하고 'trend'를 한 문장으로 더 간결하게 요약해줘.
-입력 데이터:
+            processing_prompt = f"""
+[시스템 안내]
+당신은 전문 기술 번역가이자 보안 분석가입니다. 다음 JSON 데이터에 포함된 각 CVE에 대해, 'description'을 자연스러운 한국어로 번역하고, 'trend'를 관리자가 이해하기 쉬운 한 문장의 핵심 동향으로 요약해주십시오.
+
+[입력 데이터]
 ```json
 {json.dumps(processing_data, indent=2, ensure_ascii=False)}
 ```
-응답은 반드시 다음 JSON 형식이어야 해:
+
+[출력 지시]
+아래 JSON 형식에 맞춰, 번역 및 요약된 결과를 **오직 JSON 객체만** 출력하십시오.
+
 ```json
 {{
   "processed_cves": [
     {{
       "cve_id": "CVE-XXXX-XXXX",
-      "translated_description": "한국어로 번역된 요약",
-      "concise_trend": "한 문장으로 요약된 동향"
+      "translated_description": "자연스러운 한국어로 번역된 기술 요약",
+      "concise_trend": "핵심적인 국내외 동향 한 문장 요약"
     }}
   ]
 }}
 ```
-다른 설명 없이 순수한 JSON 객체만 출력해야 합니다."""
+"""
 
             processed_result = self.perform_ai_analysis(processing_prompt, is_news_request=True)
 
