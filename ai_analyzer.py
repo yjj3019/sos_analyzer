@@ -31,6 +31,7 @@ try:
     import matplotlib
     matplotlib.use('Agg') # GUI 백엔드 없이 실행하기 위한 설정
     import matplotlib.pyplot as plt
+    import matplotlib.font_manager as fm
 except ImportError:
     matplotlib = None
     plt = None
@@ -49,6 +50,9 @@ class SosreportParser:
         subdirs = [d for d in self.extract_path.iterdir() if d.is_dir()]
         self.base_path = subdirs[0] if len(subdirs) == 1 else self.extract_path
         print(f"sosreport 데이터 분석 경로: {self.base_path}")
+        self.today_date_str = datetime.now().strftime('%Y%m%d')
+        self.today_sar_file_pattern = re.compile(f"sar{datetime.now().strftime('%d')}")
+
 
     def _read_file(self, possible_paths: List[str], default: str = 'N/A') -> str:
         """
@@ -369,47 +373,91 @@ class SosreportParser:
         return routes
 
     def _parse_sar_data(self) -> Dict[str, List[Dict[str, Any]]]:
-        """sar 명령어 출력 결과에서 성능 데이터를 파싱합니다."""
-        content = ""
-        sa_dir = self.base_path / 'var/log/sa'
-        if sa_dir.is_dir():
-            sar_files = sorted([f for f in sa_dir.iterdir() if f.name.startswith('sar') and f.is_file()])
-            if sar_files:
-                for file_path in sar_files: content += file_path.read_text(encoding='utf-8', errors='ignore') + "\n"
-        
-        if not content.strip():
-            content = self._read_file(['sos_commands/monitoring/sar_-A'])
-
-        if not content.strip(): return {}
+        """
+        sosreport 내의 /var/log/sa/sar* 파일들을 읽어 CPU, Memory, Network, Disk 데이터를 파싱합니다.
+        sosreport가 실행된 당일의 데이터만 추출합니다.
+        """
         print("sar 성능 데이터 파싱 중...")
-        performance_data = {'cpu': [], 'memory': [], 'network': []}
+        sa_dir = self.base_path / 'var/log/sa'
+        today_sar_content = ""
 
-        cpu_section = re.search(r'(\d{2}:\d{2}:\d{2}\s+CPU\s+%user\s+%nice\s+%system\s+%iowait\s+%steal\s+%idle\n(?:.*\n)+?)\n\n', content, re.MULTILINE)
+        if sa_dir.is_dir():
+            # sosreport 실행 당일의 sar 파일 (예: sarDD)
+            today_sar_files = [f for f in sa_dir.iterdir() if self.today_sar_file_pattern.match(f.name)]
+            # 특정 날짜 형식의 sar 파일 (예: sarYYYYMMDD)
+            specific_date_sar_files = [f for f in sa_dir.iterdir() if f.name.startswith('sar') and self.today_date_str in f.name]
+            
+            target_files = today_sar_files + specific_date_sar_files
+            
+            if target_files:
+                for file_path in sorted(list(set(target_files))): # 중복 제거 및 정렬
+                    print(f"  -> 당일 sar 데이터 파일 발견: {file_path.name}")
+                    try:
+                        # sar 바이너리 파일을 텍스트로 변환하기 위해 sadf 명령어 사용 시도
+                        # 실제 환경에서는 sadf가 없으므로, 텍스트 기반 sar 출력 파일만 처리
+                        today_sar_content += file_path.read_text(encoding='utf-8', errors='ignore') + "\n"
+                    except Exception as e:
+                        print(f"경고: '{file_path.name}' 파일 읽기 오류: {e}")
+            else:
+                print("  -> 당일의 sar 파일을 찾을 수 없습니다. sos_commands/monitoring/sar_-A 를 확인합니다.")
+
+        if not today_sar_content.strip():
+            # sar 파일이 없거나 바이너리 형식일 경우, sosreport의 텍스트 덤프를 사용
+            today_sar_content = self._read_file(['sos_commands/monitoring/sar_-A'])
+
+        if not today_sar_content.strip():
+            print("⚠️ 분석할 sar 데이터를 찾을 수 없습니다.")
+            return {}
+
+        performance_data = {'cpu': [], 'memory': [], 'network': [], 'disk': []}
+
+        # 정규 표현식 수정 (더 유연하게)
+        # CPU (all)
+        cpu_section = re.search(r'(\d{2}:\d{2}:\d{2}\s+(?:AM|PM)\s+CPU\s+%user\s+%nice\s+%system\s+%iowait\s+%steal\s+%idle\n(?:.*\n)+?)(?=\n\n|\Z)', today_sar_content, re.MULTILINE)
         if cpu_section:
             for line in cpu_section.group(1).strip().split('\n'):
                 parts = line.split()
-                if len(parts) >= 8 and parts[1] == 'all':
-                    performance_data['cpu'].append({'timestamp': parts[0], 'user': float(parts[2]), 'system': float(parts[4]), 'idle': float(parts[7])})
+                if len(parts) >= 9 and parts[2] == 'all':
+                    performance_data['cpu'].append({'timestamp': parts[0] + " " + parts[1], 'user': float(parts[3]), 'system': float(parts[5]), 'iowait': float(parts[6]), 'idle': float(parts[8])})
 
-        mem_section = re.search(r'(\d{2}:\d{2}:\d{2}\s+kbmemfree\s+kbmemused\s+%memused\s+kbbuffers\s+kbcached\s+kbcommit\s+%commit\n(?:.*\n)+?)\n\n', content, re.MULTILINE)
+        # Memory
+        mem_section = re.search(r'(\d{2}:\d{2}:\d{2}\s+(?:AM|PM)\s+kbmemfree\s+kbmemused\s+%memused\s+kbbuffers\s+kbcached\s+kbcommit\s+%commit\n(?:.*\n)+?)(?=\n\n|\Z)', today_sar_content, re.MULTILINE)
         if mem_section:
             for line in mem_section.group(1).strip().split('\n'):
                 parts = line.split()
-                if len(parts) >= 4 and parts[0].count(':') == 2:
-                    performance_data['memory'].append({'timestamp': parts[0], 'memused_percent': float(parts[3])})
+                if len(parts) >= 5 and parts[0].count(':') == 2:
+                    performance_data['memory'].append({'timestamp': parts[0] + " " + parts[1], 'memused_percent': float(parts[4])})
 
-        net_section = re.search(r'(\d{2}:\d{2}:\d{2}\s+IFACE\s+rxpck/s\s+txpck/s\s+rxkB/s\s+txkB/s\s+rxcmp/s\s+txcmp/s\s+rxmcst/s\n(?:.*\n)+?)\n\n', content, re.MULTILINE)
+        # Network
+        net_section = re.search(r'(\d{2}:\d{2}:\d{2}\s+(?:AM|PM)\s+IFACE\s+rxpck/s\s+txpck/s\s+rxkB/s\s+txkB/s\s+rxcmp/s\s+txcmp/s\s+rxmcst/s\n(?:.*\n)+?)(?=\n\n|\Z)', today_sar_content, re.MULTILINE)
         if net_section:
             net_agg = {}
             for line in net_section.group(1).strip().split('\n'):
                 parts = line.split()
-                if len(parts) >= 6 and parts[1] not in ('IFACE', 'lo'):
-                    ts = parts[0]
+                if len(parts) >= 7 and parts[2] not in ('IFACE', 'lo'):
+                    ts = parts[0] + " " + parts[1]
                     if ts not in net_agg: net_agg[ts] = {'rxkB': 0.0, 'txkB': 0.0}
-                    net_agg[ts]['rxkB'] += float(parts[4])
-                    net_agg[ts]['txkB'] += float(parts[5])
+                    net_agg[ts]['rxkB'] += float(parts[5])
+                    net_agg[ts]['txkB'] += float(parts[6])
             for ts, data in net_agg.items():
                 performance_data['network'].append({'timestamp': ts, **data})
+        
+        # Disk
+        disk_section = re.search(r'(\d{2}:\d{2}:\d{2}\s+(?:AM|PM)\s+DEV\s+tps\s+rkB/s\s+wkB/s\s+areq-sz\s+aqu-sz\s+await\s+%util\n(?:.*\n)+?)(?=\n\n|\Z)', today_sar_content, re.MULTILINE)
+        if disk_section:
+            disk_agg = {}
+            for line in disk_section.group(1).strip().split('\n'):
+                parts = line.split()
+                if len(parts) >= 9 and parts[2] != 'DEV':
+                    ts = parts[0] + " " + parts[1]
+                    if ts not in disk_agg: disk_agg[ts] = {'read_kB': 0.0, 'write_kB': 0.0, 'util_percent': 0.0}
+                    # 여러 디스크의 평균 또는 합계를 계산할 수 있음. 여기서는 합계로 처리.
+                    disk_agg[ts]['read_kB'] += float(parts[4])
+                    disk_agg[ts]['write_kB'] += float(parts[5])
+                    disk_agg[ts]['util_percent'] += float(parts[9]) # %util이 가장 마지막 컬럼
+            for ts, data in disk_agg.items():
+                performance_data['disk'].append({'timestamp': ts, **data})
+
 
         print("✅ sar 성능 데이터 파싱 완료.")
         return performance_data
@@ -528,11 +576,40 @@ class AIAnalyzer:
         if self.api_token:
             headers['Authorization'] = f'Bearer {self.api_token}'
         self.session.headers.update(headers)
+        
+        self._setup_korean_font()
+
 
         print("AI 분석기 초기화 완료")
         print(f"LLM 기본 URL: {self.llm_url}")
         if self.model_name:
             print(f"사용 모델: {self.model_name}")
+
+    def _setup_korean_font(self):
+        """matplotlib에서 한글을 지원하기 위한 폰트 설정"""
+        if not plt:
+            return
+        
+        # 1. 시스템에 설치된 폰트에서 'Nanum' 또는 'Malgun' 폰트 찾기
+        font_paths = fm.findSystemFonts(fontpaths=None, fontext='ttf')
+        korean_font_path = None
+        for path in font_paths:
+            if 'nanum' in path.lower() or 'malgun' in path.lower():
+                korean_font_path = path
+                break
+        
+        if korean_font_path:
+            try:
+                fm.fontManager.addfont(korean_font_path)
+                font_name = fm.FontProperties(fname=korean_font_path).get_name()
+                plt.rc('font', family=font_name)
+                plt.rc('axes', unicode_minus=False) # 마이너스 부호 깨짐 방지
+                print(f"✅ 한글 폰트 설정 완료: {font_name}")
+            except Exception as e:
+                print(f"⚠️ 한글 폰트 설정 중 오류 발생: {e}. 그래프 제목이 깨질 수 있습니다.")
+        else:
+            print("⚠️ 경고: '나눔고딕' 또는 '맑은 고딕' 폰트를 찾을 수 없습니다. 그래프의 한글이 깨질 수 있습니다.")
+
 
     def list_available_models(self):
         """서버에서 사용 가능한 모델 목록을 조회하고 출력합니다."""
@@ -948,17 +1025,25 @@ class AIAnalyzer:
         print("성능 그래프 생성 중...")
         graphs = {}
         
+        # CPU 그래프
         if perf_data.get('cpu'):
             cpu_data = perf_data['cpu']
             timestamps = [d['timestamp'] for d in cpu_data]
             user = [d['user'] for d in cpu_data]
             system = [d['system'] for d in cpu_data]
+            iowait = [d['iowait'] for d in cpu_data]
             idle = [d['idle'] for d in cpu_data]
             
-            fig, ax = plt.subplots(figsize=(10, 5))
-            ax.stackplot(timestamps, user, system, idle, labels=['User %', 'System %', 'Idle %'], colors=['#007bff', '#ffc107', '#28a745'])
-            ax.set_title('CPU Usage (%)')
+            fig, ax = plt.subplots(figsize=(12, 6))
+            ax.stackplot(timestamps, user, system, iowait, idle, 
+                         labels=['User %', 'System %', 'I/O Wait %', 'Idle %'], 
+                         colors=['#007bff', '#ffc107', '#dc3545', '#28a745'])
+            ax.set_title('CPU 사용률 (%)', fontsize=16)
+            ax.set_xlabel('시간', fontsize=12)
+            ax.set_ylabel('사용률 (%)', fontsize=12)
             ax.legend(loc='upper left')
+            ax.grid(True, linestyle='--', alpha=0.6)
+            plt.xticks(rotation=45)
             plt.tight_layout()
             
             buf = io.BytesIO()
@@ -966,15 +1051,20 @@ class AIAnalyzer:
             graphs['cpu_graph'] = base64.b64encode(buf.getvalue()).decode('utf-8')
             plt.close(fig)
 
+        # 메모리 그래프
         if perf_data.get('memory'):
             mem_data = perf_data['memory']
             timestamps = [d['timestamp'] for d in mem_data]
             mem_used = [d['memused_percent'] for d in mem_data]
             
-            fig, ax = plt.subplots(figsize=(10, 5))
-            ax.plot(timestamps, mem_used, label='Memory Used %', color='#dc3545')
-            ax.set_title('Memory Usage (%)')
+            fig, ax = plt.subplots(figsize=(12, 6))
+            ax.plot(timestamps, mem_used, label='메모리 사용률 (%)', color='#dc3545', marker='o', linestyle='-')
+            ax.set_title('메모리 사용률 (%)', fontsize=16)
+            ax.set_xlabel('시간', fontsize=12)
+            ax.set_ylabel('사용률 (%)', fontsize=12)
             ax.legend(loc='upper left')
+            ax.grid(True, linestyle='--', alpha=0.6)
+            plt.xticks(rotation=45)
             plt.tight_layout()
 
             buf = io.BytesIO()
@@ -982,22 +1072,59 @@ class AIAnalyzer:
             graphs['memory_graph'] = base64.b64encode(buf.getvalue()).decode('utf-8')
             plt.close(fig)
 
+        # 네트워크 그래프
         if perf_data.get('network'):
             net_data = perf_data['network']
             timestamps = [d['timestamp'] for d in net_data]
             rxkB = [d['rxkB'] for d in net_data]
             txkB = [d['txkB'] for d in net_data]
 
-            fig, ax = plt.subplots(figsize=(10, 5))
-            ax.plot(timestamps, rxkB, label='Received (kB/s)', color='#17a2b8')
-            ax.plot(timestamps, txkB, label='Transmitted (kB/s)', color='#6f42c1')
-            ax.set_title('Network Traffic (kB/s)')
+            fig, ax = plt.subplots(figsize=(12, 6))
+            ax.plot(timestamps, rxkB, label='수신 (kB/s)', color='#17a2b8', marker='^', linestyle='-')
+            ax.plot(timestamps, txkB, label='송신 (kB/s)', color='#6f42c1', marker='v', linestyle='-')
+            ax.set_title('네트워크 트래픽 (kB/s)', fontsize=16)
+            ax.set_xlabel('시간', fontsize=12)
+            ax.set_ylabel('kB/s', fontsize=12)
             ax.legend(loc='upper left')
+            ax.grid(True, linestyle='--', alpha=0.6)
+            plt.xticks(rotation=45)
             plt.tight_layout()
 
             buf = io.BytesIO()
             fig.savefig(buf, format='png')
             graphs['network_graph'] = base64.b64encode(buf.getvalue()).decode('utf-8')
+            plt.close(fig)
+
+        # 디스크 그래프
+        if perf_data.get('disk'):
+            disk_data = perf_data['disk']
+            timestamps = [d['timestamp'] for d in disk_data]
+            read_kB = [d['read_kB'] for d in disk_data]
+            write_kB = [d['write_kB'] for d in disk_data]
+            util_percent = [d['util_percent'] for d in disk_data]
+
+            fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 10), sharex=True)
+            
+            ax1.plot(timestamps, read_kB, label='읽기 (kB/s)', color='#28a745', marker='>', linestyle='-')
+            ax1.plot(timestamps, write_kB, label='쓰기 (kB/s)', color='#fd7e14', marker='<', linestyle='-')
+            ax1.set_title('디스크 I/O (kB/s)', fontsize=14)
+            ax1.set_ylabel('kB/s', fontsize=12)
+            ax1.legend(loc='upper left')
+            ax1.grid(True, linestyle='--', alpha=0.6)
+
+            ax2.plot(timestamps, util_percent, label='사용률 (%)', color='#6610f2', marker='s', linestyle='-')
+            ax2.set_title('디스크 사용률 (%)', fontsize=14)
+            ax2.set_xlabel('시간', fontsize=12)
+            ax2.set_ylabel('사용률 (%)', fontsize=12)
+            ax2.legend(loc='upper left')
+            ax2.grid(True, linestyle='--', alpha=0.6)
+            
+            plt.xticks(rotation=45)
+            plt.tight_layout()
+
+            buf = io.BytesIO()
+            fig.savefig(buf, format='png')
+            graphs['disk_graph'] = base64.b64encode(buf.getvalue()).decode('utf-8')
             plt.close(fig)
 
         print("✅ 성능 그래프 생성 완료.")
@@ -1148,9 +1275,10 @@ class AIAnalyzer:
         graph_html = ""
         if graphs:
             graph_html += '<div class="section"><h2>📊 성능 분석 그래프</h2>'
-            if 'cpu_graph' in graphs: graph_html += f'<h3>CPU 사용률</h3><img src="data:image/png;base64,{graphs["cpu_graph"]}" alt="CPU Graph" style="width:100%;">'
-            if 'memory_graph' in graphs: graph_html += f'<h3>메모리 사용률</h3><img src="data:image/png;base64,{graphs["memory_graph"]}" alt="Memory Graph" style="width:100%;">'
-            if 'network_graph' in graphs: graph_html += f'<h3>네트워크 트래픽</h3><img src="data:image/png;base64,{graphs["network_graph"]}" alt="Network Graph" style="width:100%;">'
+            if 'cpu_graph' in graphs: graph_html += f'<h3>CPU 사용률</h3><img src="data:image/png;base64,{graphs["cpu_graph"]}" alt="CPU Graph" style="width:100%; max-width: 800px; display: block; margin: auto;">'
+            if 'memory_graph' in graphs: graph_html += f'<h3>메모리 사용률</h3><img src="data:image/png;base64,{graphs["memory_graph"]}" alt="Memory Graph" style="width:100%; max-width: 800px; display: block; margin: auto;">'
+            if 'network_graph' in graphs: graph_html += f'<h3>네트워크 트래픽</h3><img src="data:image/png;base64,{graphs["network_graph"]}" alt="Network Graph" style="width:100%; max-width: 800px; display: block; margin: auto;">'
+            if 'disk_graph' in graphs: graph_html += f'<h3>디스크 I/O 및 사용률</h3><img src="data:image/png;base64,{graphs["disk_graph"]}" alt="Disk Graph" style="width:100%; max-width: 800px; display: block; margin: auto;">'
             graph_html += '</div>'
         
         netdev_rx_rows = ""
@@ -1505,17 +1633,31 @@ def main():
         sos_data = parser.parse()
 
         base_name = Path(args.sosreport_archive).stem.replace('.tar', '')
+        # sar 데이터만 따로 JSON 파일로 저장
+        sar_data_path = Path(args.output) / f"{base_name}_sar_data.json"
+        try:
+            with open(sar_data_path, 'w', encoding='utf-8') as f:
+                json.dump(sos_data.get("performance_data", {}), f, indent=2, ensure_ascii=False)
+            print(f"✅ 추출된 sar 데이터 JSON 파일로 저장 완료: {sar_data_path}")
+        except Exception as e:
+            print(f"❌ 추출된 sar 데이터 JSON 저장 실패: {e}")
+
+        # 전체 파싱 데이터도 저장 (기존 로직 유지)
         parsed_data_path = Path(args.output) / f"{base_name}_extracted_data.json"
         try:
             with open(parsed_data_path, 'w', encoding='utf-8') as f:
                 json.dump(sos_data, f, indent=2, ensure_ascii=False)
-            print(f"✅ 추출된 데이터 JSON 파일로 저장 완료: {parsed_data_path}")
+            print(f"✅ 전체 추출 데이터 JSON 파일로 저장 완료: {parsed_data_path}")
         except Exception as e:
-            print(f"❌ 추출된 데이터 JSON 저장 실패: {e}")
+            print(f"❌ 전체 추출 데이터 JSON 저장 실패: {e}")
+
 
         prompt = analyzer.create_analysis_prompt(sos_data)
         result = analyzer.perform_ai_analysis(prompt)
         print("✅ AI 시스템 분석 완료!")
+        
+        # AI 분석 결과를 sos_data에 추가하여 HTML 보고서에서 함께 사용
+        sos_data['ai_analysis'] = result
 
         sos_data['security_news'] = analyzer.fetch_security_news(sos_data)
         
@@ -1526,13 +1668,16 @@ def main():
             html_path = analyzer.create_html_report(result, sos_data, graphs, args.output, args.sosreport_archive)
             results['html_file'] = html_path
         
+        results['sar_data_file'] = str(sar_data_path)
         results['extracted_data_file'] = str(parsed_data_path)
 
         print("\n분석이 성공적으로 완료되었습니다!")
         if 'html_file' in results:
             print(f"  - HTML 보고서: {results['html_file']}")
+        if 'sar_data_file' in results:
+            print(f"  - SAR 데이터 (JSON): {results['sar_data_file']}")
         if 'extracted_data_file' in results:
-            print(f"  - 원본 추출 데이터 (JSON): {results['extracted_data_file']}")
+            print(f"  - 전체 추출 데이터 (JSON): {results['extracted_data_file']}")
 
     except Exception as e:
         print(f"\n❌ 전체 분석 과정 중 오류 발생: {e}")
