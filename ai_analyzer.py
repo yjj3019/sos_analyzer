@@ -6,9 +6,6 @@ sosreport 압축 파일을 입력받아 압축 해제, 데이터 추출, AI 분�
 사용법:
     # 기본 사용법 (sosreport 압축 파일을 입력)
     python3 ai_analyzer.py sosreport-archive.tar.xz --llm-url <URL> --model <MODEL> --api-token <TOKEN>
-
-    # 사용 가능한 모델 목록 확인
-    python3 ai_analyzer.py --llm-url <URL> --api-token <TOKEN> --list-models
 """
 
 import os
@@ -26,6 +23,7 @@ from typing import Dict, Any, Optional, List
 import html # HTML 이스케이프를 위해 추가
 import io
 import base64
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # --- 그래프 생성을 위한 라이브러리 ---
 # "pip install matplotlib" 명령어로 설치 필요
@@ -36,6 +34,15 @@ try:
 except ImportError:
     matplotlib = None
     plt = None
+
+# --- 웹 스크레이핑을 위한 라이브러리 ---
+# "pip install beautifulsoup4 google-api-python-client" 명령어로 설치 필요
+try:
+    from bs4 import BeautifulSoup
+    # Web Search를 위한 google_search는 외부에서 제공되는 것으로 가정합니다.
+    # from google_search import search as google_search 
+except ImportError:
+    BeautifulSoup = None
 
 class SosreportParser:
     """sosreport 압축 해제 후 디렉토리에서 데이터를 파싱하여 JSON 구조로 만듭니다."""
@@ -59,23 +66,37 @@ class SosreportParser:
                     return "파일 읽기 오류"
         return default
     
-    # [개선된 기능] 설치된 패키지 이름과 버전을 모두 파싱하는 함수
     def _parse_installed_packages(self) -> List[str]:
         """installed-rpms 파일에서 '패키지-버전-릴리즈' 전체 문자열을 파싱합니다."""
-        rpm_content = self._read_file(['installed-rpms', 'sos_commands/rpm/rpm_-qa', 'rpm-qa'])
-        if rpm_content == 'N/A':
+        # [수정] 사용자가 요청한 새로운 rpm 경로 리스트로 변경
+        rpm_content = self._read_file([
+            'installed-rpms', 
+            'sos_commands/rpm/sh_-c_rpm_--nodigest_-qa_--qf_NAME_-_VERSION_-_RELEASE_._ARCH_INSTALLTIME_date_awk_-F_printf_-59s_s_n_1_2_sort_-V', 
+            'sos_commands/lvm2/vgdisplay_-vv_--config_global_metadata_read_only_1_--nolocking_--foreign', 
+            'sos_commands/rpm/sh_-c_rpm_--nodigest_-qa_--qf_-59_NVRA_INSTALLTIME_date_sort_-V'
+        ])
+
+        if rpm_content == 'N/A' or not rpm_content.strip():
+            print("⚠️ 'installed-rpms' 파일을 찾을 수 없거나 내용이 비어 있습니다.")
             return []
         
         packages = []
+        # rpm 쿼리 결과가 복잡할 수 있으므로, 일반적인 패키지 이름 형식을 추출하도록 정규식 사용
+        package_pattern = re.compile(r'^([a-zA-Z0-9_.+-]+-\d+.*)')
         for line in rpm_content.split('\n'):
             line = line.strip()
             if not line or line.startswith(('gpg-pubkey', 'warning:', 'error:')):
                 continue
-            # 공백으로 구분된 첫 번째 필드가 패키지 정보일 수 있음 (dnf/yum list installed)
-            parts = line.split()
-            if len(parts) > 0:
-                # 'httpd-2.4.37-56.el8.x86_64'와 같은 형식의 전체 문자열을 저장
-                packages.append(parts[0])
+            
+            match = package_pattern.match(line)
+            if match:
+                packages.append(match.group(1))
+            else:
+                # 간단한 형식 (이름만 있는 경우)
+                parts = line.split()
+                if len(parts) > 0:
+                    packages.append(parts[0])
+
 
         unique_packages = sorted(list(set(packages)))
         print(f"✅ 설치된 패키지(버전 포함) 파싱 완료: {len(unique_packages)}개")
@@ -248,7 +269,7 @@ class SosreportParser:
         """NETDEV, SOCKSTAT, BONDING, ETHTOOL 정보를 파싱합니다."""
         details = {'netdev': [], 'sockstat': [], 'bonding': [], 'ethtool': {}}
 
-        # NETDEV from /proc/net/dev
+        # NETDEV
         netdev_content = self._read_file(['proc/net/dev'])
         for line in netdev_content.split('\n')[2:]:
             if ':' not in line: continue
@@ -264,11 +285,11 @@ class SosreportParser:
                     'tx_fifo': int(stat_values[12]), 'tx_colls': int(stat_values[13]), 'tx_carrier': int(stat_values[14]), 'tx_compressed': int(stat_values[15])
                 })
 
-        # SOCKSTAT from /proc/net/sockstat
+        # SOCKSTAT
         sockstat_content = self._read_file(['proc/net/sockstat'])
         details['sockstat'] = sockstat_content.split('\n')
 
-        # BONDING from /proc/net/bonding/*
+        # BONDING
         bonding_dir = self.base_path / 'proc/net/bonding'
         if bonding_dir.is_dir():
             for bond_file in bonding_dir.iterdir():
@@ -280,7 +301,7 @@ class SosreportParser:
                 bond_info['slaves'] = slaves
                 details['bonding'].append(bond_info)
         
-        # ETHTOOL from sos_commands/networking/ethtool_*
+        # ETHTOOL
         ethtool_dir = self.base_path / 'sos_commands/networking'
         if ethtool_dir.is_dir():
             all_ifaces = [dev['iface'] for dev in details['netdev']]
@@ -513,7 +534,6 @@ class AIAnalyzer:
 
             if is_news_request:
                 llm_log_path = self.output_dir / "llm_security_news.log"
-                # 'a' (append) mode to keep logs from multiple calls
                 with open(llm_log_path, 'a', encoding='utf-8') as f:
                     f.write("\n\n--- NEW PROMPT FOR SECURITY NEWS ---\n")
                     f.write(prompt)
@@ -521,7 +541,6 @@ class AIAnalyzer:
                 print("\n--- LLM에게 보낸 보안 뉴스 프롬프트 ---")
                 print(prompt[:500] + "...")
                 print("-------------------------------------\n")
-
 
             response = self.session.post(self.completion_url, json=payload, timeout=self.timeout)
             print(f"API 응답 시간: {time.time() - start_time:.2f}초")
@@ -596,20 +615,15 @@ class AIAnalyzer:
         if not ai_response or not ai_response.strip():
             raise ValueError("AI 응답이 비어 있습니다.")
 
-        # LLM의 거절 메시지 패턴 확인
         refusal_patterns = [
             "i'm sorry", "i cannot", "i can't", "i am unable", 
             "죄송합니다", "할 수 없습니다"
         ]
-        # 응답을 소문자로 변환하여 패턴 검사
         if any(pattern in ai_response.lower() for pattern in refusal_patterns):
             raise ValueError(f"LLM이 요청 처리를 거부했습니다. (응답: '{ai_response.strip()}')")
 
         try:
-            # 마크다운 코드 블록과 앞뒤 공백을 제거
             cleaned_response = re.sub(r'^```(json)?\s*|\s*```$', '', ai_response.strip())
-            
-            # JSON 객체가 시작하고 끝나는 부분을 명시적으로 찾음
             start = cleaned_response.find('{')
             end = cleaned_response.rfind('}')
             
@@ -623,41 +637,83 @@ class AIAnalyzer:
             print(error_message)
             raise ValueError(error_message)
         except ValueError as e:
-            # 여기서 발생하는 ValueError는 JSON 객체 못찾는 경우 포함
             error_message = f"AI 응답 처리 중 오류 발생: {e}.\n--- 원본 응답 ---\n{ai_response}\n----------------"
             print(error_message)
             raise ValueError(error_message)
 
-    # [개선된 기능] 보안 뉴스 조회 및 AI 분석 프롬프트
-    def fetch_security_news(self, sos_data: Dict[str, Any]) -> List[Dict[str, str]]:
-        """RHEL 관련 최신 보안 뉴스를 현재 시스템의 패키지 및 커널 버전을 참고하여 선별하고, 선별 이유를 로깅합니다."""
-        print("최신 RHEL 보안 뉴스 조회 중 (Red Hat API 직접 호출)...")
+    def fetch_web_search_cves(self, installed_package_names: set) -> set:
+        """Web Search를 통해 설치된 패키지와 관련된 최신 CVE 정보를 수집합니다."""
+        print("Web Search를 통해 최신 CVE 정보 수집 중...")
+        web_cves = set()
+        cve_pattern = re.compile(r'CVE-\d{4}-\d{4,7}', re.IGNORECASE)
+        
+        # 시스템의 핵심 패키지나 자주 사용되는 패키지를 우선 검색
+        priority_packages = ['kernel', 'openssl', 'glibc', 'httpd', 'openssh', 'systemd', 'qemu-kvm', 'libvirt', 'java']
+        search_packages = [pkg for pkg in priority_packages if pkg in installed_package_names]
+        # 만약 우선순위 패키지가 없다면, 전체 패키지 중 일부를 사용
+        if not search_packages:
+            search_packages = list(installed_package_names)[:5]
+
+        queries = []
+        for pkg in search_packages:
+            queries.append(f'"{pkg}" Red Hat Enterprise Linux vulnerability CVE')
+            queries.append(f'"{pkg}" RHEL 보안 취약점 CVE')
+
+        print(f"Web Search 쿼리: {queries}")
+
         try:
+            # google_search가 외부에서 제공되는 함수라고 가정
+            search_results = google_search.search(queries=queries)
+            for result_set in search_results:
+                if result_set.results:
+                    for result in result_set.results:
+                        if result.snippet:
+                            found = cve_pattern.findall(result.snippet)
+                            for cve in found:
+                                web_cves.add(cve.upper())
+            print(f"Web Search를 통해 {len(web_cves)}개의 고유 CVE를 수집했습니다: {web_cves if web_cves else '없음'}")
+        except Exception as e:
+            print(f"⚠️ Web Search 중 오류 발생: {e}")
+
+        return web_cves
+
+    def fetch_security_news(self, sos_data: Dict[str, Any]) -> List[Dict[str, str]]:
+        """
+        Red Hat API와 Web Search를 통해 시스템에 가장 중요한 CVE를 선별합니다.
+        """
+        print("최신 RHEL 보안 뉴스 조회 및 Web Search 정보와 교차 분석 시작...")
+        
+        installed_packages_db = set(sos_data.get("installed_packages", []))
+        if not installed_packages_db:
+            reason = "sosreport에 설치된 패키지 정보(installed-rpms)가 없어 CVE 연관성을 분석할 수 없습니다."
+            print(f"⚠️ {reason}")
+            return [{"reason": reason}]
+
+        try:
+            installed_package_names_only = set(re.sub(r'-[\d.:].*', '', pkg) for pkg in installed_packages_db)
+            
+            # [수정] Web Search 기능 호출
+            web_priority_cves = self.fetch_web_search_cves(installed_package_names_only)
+
             kernel_version = sos_data.get("system_info", {}).get("kernel", "N/A")
-            installed_packages_full = sos_data.get("installed_packages", [])
-            installed_package_names = set(re.sub(r'-[\d.:].*', '', pkg) for pkg in installed_packages_full)
 
             print(f"분석 대상 시스템 커널 버전: {kernel_version}")
-            print(f"분석 대상 시스템의 설치된 패키지 {len(installed_packages_full)}개를 참고합니다.")
+            print(f"분석 대상 시스템의 설치된 패키지 {len(installed_packages_db)}개를 DB화하여 참고합니다.")
 
-            # 1. Red Hat의 공식 CVE 데이터 API를 직접 호출
             api_url = "https://access.redhat.com/hydra/rest/securitydata/cve.json"
             print(f"Red Hat CVE API 호출: {api_url}")
             response = requests.get(api_url, timeout=120)
             if response.status_code != 200:
-                print(f"⚠️ Red Hat CVE API 조회 실패 (HTTP {response.status_code}), 보안 뉴스 조회를 건너뜁니다.")
-                return []
+                print(f"⚠️ Red Hat CVE API 조회 실패 (HTTP {response.status_code})")
+                return [{"reason": f"Red Hat CVE API 조회에 실패했습니다 (HTTP {response.status_code})."}]
 
             all_cves = response.json()
-            print(f"총 {len(all_cves)}개의 CVE 데이터를 가져왔습니다.")
+            print(f"총 {len(all_cves)}개의 CVE 데이터를 Red Hat에서 가져왔습니다.")
             
-            # 2. 데이터 필터링 (최근 180일, Critical/Important 등급)
             now = datetime.now()
             start_date = now - timedelta(days=180)
             
-            directly_relevant_cves = []
-            contextually_relevant_cves = []
-
+            system_relevant_cves = []
             for cve in all_cves:
                 public_date_str = cve.get('public_date')
                 if not public_date_str: continue
@@ -670,51 +726,43 @@ class AIAnalyzer:
                 if not (start_date <= cve_date <= now and isinstance(cve.get('severity'), str) and cve.get('severity').lower() in ["critical", "important"]):
                     continue
                 
-                # [핵심 로직] 설치된 패키지와 직접적인 연관성 검사
-                is_direct_match = False
-                affected_packages = cve.get('affected_packages', [])
-                if affected_packages:
-                    for pkg_str in affected_packages:
-                        # 'httpd-2.4.37-56.el8' 와 같은 문자열에서 패키지 이름 'httpd'만 추출
-                        pkg_name_match = re.match(r'^([a-zA-Z0-9_.+-]+)-', pkg_str)
-                        if pkg_name_match and pkg_name_match.group(1) in installed_package_names:
-                            is_direct_match = True
-                            break # 하나라도 일치하면 검사 중단
-                
-                if is_direct_match:
-                    directly_relevant_cves.append(cve)
+                cve_affected_packages = cve.get('affected_packages', [])
+                if any(re.match(r'^([a-zA-Z0-9_.+-]+)-', pkg_str) and re.match(r'^([a-zA-Z0-9_.+-]+)-', pkg_str).group(1) in installed_package_names_only for pkg_str in cve_affected_packages):
+                    system_relevant_cves.append(cve)
+
+            if not system_relevant_cves:
+                reason = "시스템에 설치된 패키지에 직접적인 영향을 주는 최신 보안 뉴스가 없습니다."
+                print(reason)
+                return [{"reason": reason}]
+
+            print(f"시스템 관련 CVE {len(system_relevant_cves)}개를 1차 선별했습니다.")
+
+            top_priority_cves = []
+            normal_priority_cves = []
+            for cve in system_relevant_cves:
+                if cve.get('CVE') in web_priority_cves:
+                    cve['priority_reason'] = "최신 웹 검색 결과에서 언급된, 시스템에 직접 영향을 주는 취약점"
+                    top_priority_cves.append(cve)
                 else:
-                    contextually_relevant_cves.append(cve)
+                    normal_priority_cves.append(cve)
             
-            print(f"필터링 후: 직접 관련 CVE {len(directly_relevant_cves)}개, 정황상 관련 CVE {len(contextually_relevant_cves)}개")
+            analysis_target_cves = top_priority_cves + normal_priority_cves
+            print(f"우선순위 정렬 후: 웹 검색 언급 CVE {len(top_priority_cves)}개, 기타 시스템 관련 CVE {len(normal_priority_cves)}개")
 
-            if not directly_relevant_cves:
-                print("시스템에 직접적인 영향을 주는 최신 보안 뉴스가 없습니다.")
-                # 직접 관련 CVE가 없으면 정황상 관련 CVE를 분석 대상으로 사용
-                if not contextually_relevant_cves:
-                    print("분석할 보안 뉴스가 없습니다.")
-                    return []
-                analysis_target_cves = contextually_relevant_cves
-                is_direct_analysis = False
-            else:
-                analysis_target_cves = directly_relevant_cves
-                is_direct_analysis = True
+            cve_identifiers_with_priority = []
+            for cve in analysis_target_cves:
+                if 'priority_reason' in cve:
+                    cve_identifiers_with_priority.append(f"{cve['CVE']} (최우선)")
+                else:
+                    cve_identifiers_with_priority.append(cve['CVE'])
 
-            # 3. [1단계 AI 분석] 가장 중요한 CVE 5개 선정
-            cve_identifiers = [cve['CVE'] for cve in analysis_target_cves]
-            packages_str = "\n- ".join(installed_packages_full[:50]) + ("..." if len(installed_packages_full) > 50 else "")
-
-            # AI 프롬프트에 전달할 분석 대상 CVE 목록 설명
-            target_cve_description = (
-                "아래 목록은 현재 시스템에 설치된 패키지에 직접적인 영향을 미치는 것으로 확인된 CVE입니다. **이 목록 내에서만** 분석하고 선정하십시오." 
-                if is_direct_analysis 
-                else "시스템에 직접적인 영향을 주는 CVE는 발견되지 않았습니다. 대신, 시스템의 커널 버전과 주요 컴포넌트를 고려하여 아래의 정황상 관련성이 높은 CVE 목록을 분석하십시오."
-            )
+            packages_str = "\n- ".join(list(installed_packages_db)[:50]) + ("..." if len(installed_packages_db) > 50 else "")
 
             selection_prompt = f"""
 [시스템 안내]
 당신은 Red Hat Enterprise Linux(RHEL)를 전문으로 다루는 '시니어 보안 위협 분석가'입니다.
-당신의 임무는 주어진 RHEL 관련 보안 취약점 목록을 분석하여, 특정 시스템에 가장 시급하고 중요한 Top 5를 선별하고, 그 선별 이유를 명확히 기록하는 것입니다.
+당신의 임무는 주어진 RHEL 관련 보안 취약점 목록을 분석하여, 특정 시스템에 가장 시급하고 중요한 Top 10을 선별하고, 그 선별 이유를 명확히 기록하는 것입니다.
+선별 과정에서 필요하다면 Web Search 를 활성화하여 검색을 진행합니다. 
 
 [분석 대상 시스템 정보]
 - **커널 버전:** {kernel_version}
@@ -722,19 +770,18 @@ class AIAnalyzer:
 - {packages_str}
 
 [선별 기준]
-1.  **영향받는 핵심 컴포넌트:** `kernel`, `glibc`, `openssl`, `openssh`, `systemd` 등 RHEL 시스템의 핵심 컴포넌트에 영향을 주는 취약점을 우선적으로 다룹니다.
-2.  **RHEL 관련성:** 반드시 Red Hat에서 공식적으로 RHEL에 영향을 미친다고 확인한 취약점이어야 합니다.
-3.  **커널 연관성:** 현재 시스템의 커널 버전에 직접적인 영향을 미치는 취약점을 우선으로 고려합니다.
+1.  **웹 동향 (최우선):** 목록에서 `(최우선)`으로 표시된 CVE는 시스템에 직접적인 영향을 주면서 최신 웹 검색에서도 언급된 시급한 취약점이므로 반드시 최우선으로 고려해야 합니다.
+2.  **시스템 패키지 연관성:** 주어진 목록의 모든 CVE는 이미 시스템에 설치된 패키지와 연관성이 확인된 상태입니다.
+3.  **영향받는 핵심 컴포넌트:** `kernel`, `glibc`, `openssl`, `openssh`, `systemd` 등 RHEL 시스템의 핵심 컴포넌트에 영향을 주는 취약점을 우선적으로 다룹니다.
 4.  **실제 공격 가능성(Exploitability):** 공개된 공격 코드가 있거나, 실제 공격(In-the-wild)에 사용된 사례가 있는 취약점을 우선으로 고려합니다.
 
 [입력 데이터]
-{target_cve_description}
-분석 대상 RHEL 관련 CVE 목록: {', '.join(cve_identifiers)}
+분석 대상 CVE 목록 (모두 시스템 관련성이 있으며, 우선순위 순으로 정렬됨): {', '.join(cve_identifiers_with_priority)}
 
 [출력 지시]
-위 선별 기준을 종합적으로 적용하여 선정한 Top 5 CVE에 대한 정보를 아래 JSON 형식에 맞춰 **오직 JSON 객체만** 출력하십시오.
+위 선별 기준을 종합적으로 적용하여 선정한 Top 10 CVE에 대한 정보를 아래 JSON 형식에 맞춰 **오직 JSON 객체만** 출력하십시오.
 - `cve_id`: **반드시 [입력 데이터]에 존재하는 CVE ID 중에서만** 선택해야 합니다.
-- `selection_reason`: 왜 이 CVE를 선택했는지 선별 기준(특히 **시스템 패키지 연관성**)에 근거하여 **한국어로 명확하고 간결하게** 기술해야 합니다. (예: "시스템에 설치된 'httpd-2.4.37-56.el8.x86_64' 패키지에 직접적인 영향을 주는 원격 코드 실행 취약점임.")
+- `selection_reason`: 왜 이 CVE를 선택했는지 선별 기준(특히 웹 동향 및 시스템 패키지 연관성)에 근거하여 **한국어로 명확하고 간결하게** 기술해야 합니다.
 
 ```json
 {{
@@ -752,9 +799,8 @@ class AIAnalyzer:
             
             if not (isinstance(selection_result, dict) and 'cve_selection' in selection_result and selection_result['cve_selection']):
                 print("⚠️ LLM이 중요 CVE를 선정하지 못했습니다.")
-                return []
+                return [{"reason": "AI가 분석 대상 CVE 목록에서 중요 CVE를 선정하지 못했습니다."}]
 
-            # --- 선별 이유 로깅 및 데이터 검증 ---
             llm_log_path = self.output_dir / "llm_security_news.log"
             selected_cves_from_llm = selection_result['cve_selection']
             
@@ -779,15 +825,9 @@ class AIAnalyzer:
 
             if not top_cves_data:
                 print("⚠️ AI가 선정한 유효한 CVE가 없습니다.")
-                return []
+                return [{"reason": "AI가 유효한 CVE를 선정하지 못했습니다."}]
 
-            # 4. [2단계 AI 분석] 원본 요약 번역
-            processing_data = []
-            for cve in top_cves_data:
-                processing_data.append({
-                    "cve_id": cve['CVE'],
-                    "description": cve.get('bugzilla_description', '요약 정보 없음'),
-                })
+            processing_data = [{"cve_id": cve['CVE'], "description": cve.get('bugzilla_description', '요약 정보 없음')} for cve in top_cves_data]
 
             processing_prompt = f"""
 [시스템 안내]
@@ -815,7 +855,6 @@ class AIAnalyzer:
 
             processed_result = self.perform_ai_analysis(processing_prompt, is_news_request=True)
 
-            # 5. 최종 데이터 조합
             final_cves = []
             if isinstance(processed_result, dict) and 'processed_cves' in processed_result:
                 processed_map = {item['cve_id']: item for item in processed_result['processed_cves']}
@@ -826,12 +865,11 @@ class AIAnalyzer:
                         cve_date_str = cve_data.get('public_date', '')
                         if cve_date_str:
                             try:
-                                datetime.strptime(cve_date_str, '%y/%m/%d')
-                            except ValueError:
                                 cve_data['public_date'] = datetime.fromisoformat(cve_date_str.replace('Z', '+00:00')).strftime('%y/%m/%d')
+                            except ValueError:
+                                pass
                         
                         cve_data['bugzilla_description'] = processed_info.get('translated_description', cve_data['bugzilla_description'])
-                        
                         final_cves.append(cve_data)
                         print(f"✅ 보안 뉴스 처리 완료: {cve_id}")
             else:
@@ -843,8 +881,7 @@ class AIAnalyzer:
 
         except Exception as e:
             print(f"❌ 보안 뉴스 조회 중 심각한 오류 발생: {e}")
-            return []
-
+            return [{"reason": f"보안 뉴스 조회 중 오류가 발생했습니다: {e}"}]
 
     def create_performance_graphs(self, perf_data: Dict[str, List[Dict[str, Any]]]) -> Dict[str, str]:
         """성능 데이터를 바탕으로 그래프를 생성하고 base64로 인코딩하여 반환합니다."""
@@ -855,7 +892,6 @@ class AIAnalyzer:
         print("성능 그래프 생성 중...")
         graphs = {}
         
-        # CPU 그래프
         if perf_data.get('cpu'):
             cpu_data = perf_data['cpu']
             timestamps = [d['timestamp'] for d in cpu_data]
@@ -866,10 +902,7 @@ class AIAnalyzer:
             fig, ax = plt.subplots(figsize=(10, 5))
             ax.stackplot(timestamps, user, system, idle, labels=['User %', 'System %', 'Idle %'], colors=['#007bff', '#ffc107', '#28a745'])
             ax.set_title('CPU Usage (%)')
-            ax.set_xlabel('Time')
-            ax.set_ylabel('Usage (%)')
             ax.legend(loc='upper left')
-            ax.tick_params(axis='x', rotation=45)
             plt.tight_layout()
             
             buf = io.BytesIO()
@@ -877,7 +910,6 @@ class AIAnalyzer:
             graphs['cpu_graph'] = base64.b64encode(buf.getvalue()).decode('utf-8')
             plt.close(fig)
 
-        # 메모리 그래프
         if perf_data.get('memory'):
             mem_data = perf_data['memory']
             timestamps = [d['timestamp'] for d in mem_data]
@@ -886,10 +918,7 @@ class AIAnalyzer:
             fig, ax = plt.subplots(figsize=(10, 5))
             ax.plot(timestamps, mem_used, label='Memory Used %', color='#dc3545')
             ax.set_title('Memory Usage (%)')
-            ax.set_xlabel('Time')
-            ax.set_ylabel('Usage (%)')
             ax.legend(loc='upper left')
-            ax.tick_params(axis='x', rotation=45)
             plt.tight_layout()
 
             buf = io.BytesIO()
@@ -897,7 +926,6 @@ class AIAnalyzer:
             graphs['memory_graph'] = base64.b64encode(buf.getvalue()).decode('utf-8')
             plt.close(fig)
 
-        # 네트워크 그래프
         if perf_data.get('network'):
             net_data = perf_data['network']
             timestamps = [d['timestamp'] for d in net_data]
@@ -908,10 +936,7 @@ class AIAnalyzer:
             ax.plot(timestamps, rxkB, label='Received (kB/s)', color='#17a2b8')
             ax.plot(timestamps, txkB, label='Transmitted (kB/s)', color='#6f42c1')
             ax.set_title('Network Traffic (kB/s)')
-            ax.set_xlabel('Time')
-            ax.set_ylabel('kB/s')
             ax.legend(loc='upper left')
-            ax.tick_params(axis='x', rotation=45)
             plt.tight_layout()
 
             buf = io.BytesIO()
@@ -929,7 +954,6 @@ class AIAnalyzer:
         base_name = Path(original_file).stem.replace('.tar', '')
         report_file = Path(output_dir) / f"{base_name}_report.html"
 
-        # AI 분석 결과 추출
         status = html.escape(analysis_result.get('system_status', 'N/A'))
         score = analysis_result.get('overall_health_score', 'N/A')
         summary = html.escape(analysis_result.get('summary', '정보 없음')).replace('\n', '<br>')
@@ -937,7 +961,6 @@ class AIAnalyzer:
         warnings = analysis_result.get('warnings', [])
         recommendations = analysis_result.get('recommendations', [])
         
-        # 시스템 정보 추출
         system_info = sos_data.get('system_info', {})
         ip4_details = sos_data.get('ip4_details', [])
         network_details = sos_data.get('network_details', {})
@@ -949,7 +972,6 @@ class AIAnalyzer:
         status_colors = {"정상": "#28a745", "주의": "#ffc107", "위험": "#dc3545"}
         status_color = status_colors.get(status, "#6c757d")
 
-        # IP4 상세 정보 테이블 행 생성 (아이콘 및 색상 포함)
         ip4_details_rows = ""
         if not ip4_details:
             ip4_details_rows = "<tr><td colspan='6' style='text-align:center;'>데이터 없음</td></tr>"
@@ -974,15 +996,18 @@ class AIAnalyzer:
                     </tr>
                 """
 
-        # HTML 테이블 생성 함수
-        def create_table_rows(data_list, headers, no_data_message="데이터 없음"):
+        def create_table_rows(data_list, headers):
             rows = ""
             if not data_list:
-                return f"<tr><td colspan='{len(headers)}' style='text-align:center;'>{no_data_message}</td></tr>"
+                return f"<tr><td colspan='{len(headers)}' style='text-align:center;'>데이터 없음</td></tr>"
+            
+            if isinstance(data_list, list) and len(data_list) == 1 and 'reason' in data_list[0]:
+                reason_text = html.escape(data_list[0]['reason'])
+                return f"<tr><td colspan='{len(headers)}' style='text-align:center;'>{reason_text}</td></tr>"
+
             for item in data_list:
                 rows += "<tr>"
                 for header in headers:
-                    # CVE-ID를 링크로 만들기
                     if header == 'CVE' and isinstance(item.get(header), str):
                         cve_id = html.escape(item.get(header))
                         rows += f'<td><a href="https://access.redhat.com/security/cve/{cve_id}" target="_blank">{cve_id}</a></td>'
@@ -991,7 +1016,6 @@ class AIAnalyzer:
                 rows += "</tr>"
             return rows
 
-        # 그래프 섹션 HTML 생성
         graph_html = ""
         if graphs:
             graph_html += '<div class="section"><h2>📊 성능 분석 그래프</h2>'
@@ -1000,7 +1024,6 @@ class AIAnalyzer:
             if 'network_graph' in graphs: graph_html += f'<h3>네트워크 트래픽</h3><img src="data:image/png;base64,{graphs["network_graph"]}" alt="Network Graph" style="width:100%;">'
             graph_html += '</div>'
         
-        # NETDEV 테이블 생성
         netdev_rx_rows = ""
         netdev_tx_rows = ""
         netdev_data = network_details.get('netdev', [])
@@ -1013,7 +1036,6 @@ class AIAnalyzer:
             netdev_rx_rows += f"<tr><td>{html.escape(dev['iface'])}</td><td>{dev['rx_bytes']:,}</td><td>{dev['rx_packets']:,}</td><td>{dev['rx_errs']}</td><td>{dev['rx_drop']} {rx_drop_pct}</td><td>{dev['rx_multicast']} {rx_multicast_pct}</td></tr>"
             netdev_tx_rows += f"<tr><td>{html.escape(dev['iface'])}</td><td>{dev['tx_bytes']:,}</td><td>{dev['tx_packets']:,}</td><td>{dev['tx_errs']}</td><td>{dev['tx_drop']}</td><td>{dev['tx_colls']}</td><td>{dev['tx_carrier']}</td></tr>"
 
-        # ETHTOOL 테이블 생성
         ethtool_rows = ""
         ethtool_data = network_details.get('ethtool', {})
         for iface, data in ethtool_data.items():
@@ -1102,7 +1124,7 @@ class AIAnalyzer:
                 </table>
             </div>
             <div class="section">
-                <h2>💾 스토리지 및 파일 시스템</h2>
+                <h2>� 스토리지 및 파일 시스템</h2>
                 <table class="data-table">
                     <thead><tr><th>Filesystem</th><th>Size</th><th>Used</th><th>Avail</th><th>Use%</th><th>Mounted on</th></tr></thead>
                     <tbody>{create_table_rows(storage_info, ['filesystem', 'size', 'used', 'avail', 'use%', 'mounted_on'])}</tbody>
@@ -1169,12 +1191,12 @@ class AIAnalyzer:
                 </div>
             </div>
 
-            <!-- 보안 뉴스 섹션 (AI 분석 섹션 뒤로 이동) -->
+            <!-- 보안 뉴스 섹션 -->
             <div class="section">
-                <h2>🛡️ 보안 뉴스 (가장 중요한 5개)</h2>
+                <h2>🛡️ 보안 뉴스 (가장 중요한 10개)</h2>
                 <table class="data-table">
                     <thead><tr><th>CVE 식별자</th><th>심각도</th><th>생성일</th><th>요약</th></tr></thead>
-                    <tbody>{create_table_rows(security_news, ['CVE', 'severity', 'public_date', 'bugzilla_description'], "보안 뉴스 정보를 가져오지 못했습니다.")}</tbody>
+                    <tbody>{create_table_rows(security_news, ['CVE', 'severity', 'public_date', 'bugzilla_description'])}</tbody>
                 </table>
                 <p style="font-size: 12px; text-align: center;">보안 정보에 대한 상세 내용은 <a href="https://access.redhat.com/security/security-updates/security-advisories" target="_blank">Red Hat Security Advisories</a> 사이트에서 확인하실 수 있습니다.</p>
             </div>
@@ -1212,10 +1234,7 @@ def decompress_sosreport(archive_path: str, extract_dir: str) -> str:
         raise Exception(f"압축 파일 해제 실패: {e}")
 
 def rmtree_onerror(func, path, exc_info):
-    """
-    shutil.rmtree를 위한 오류 핸들러.
-    PermissionError가 발생하면 파일 권한을 변경하고 작업을 재시도합니다.
-    """
+    """shutil.rmtree를 위한 오류 핸들러."""
     if isinstance(exc_info[1], PermissionError):
         try:
             os.chmod(path, 0o777)
@@ -1293,7 +1312,6 @@ def main():
         result = analyzer.perform_ai_analysis(prompt)
         print("✅ AI 시스템 분석 완료!")
 
-        # 보안 뉴스 데이터 가져오기 (sos_data 전달)
         sos_data['security_news'] = analyzer.fetch_security_news(sos_data)
         
         graphs = analyzer.create_performance_graphs(sos_data.get("performance_data", {}))
