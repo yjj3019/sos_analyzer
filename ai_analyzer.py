@@ -52,10 +52,34 @@ class SosreportParser:
         self.base_path = subdirs[0] if len(subdirs) == 1 else self.extract_path
         print(f"sosreport 데이터 분석 경로: {self.base_path}")
         
-        self.report_date = datetime.now()
+        # sosreport 수집 날짜를 기준으로 sar 파일 패턴 생성
+        date_content = self._read_file(['sos_commands/general/date', 'date'])
+        self.report_date = datetime.now() # Fallback
+
+        if date_content != 'N/A':
+            try:
+                # 다양한 날짜 형식 파싱 시도 (예: Wed Aug 27 10:50:01 KST 2025)
+                match = re.search(r'([A-Za-z]{3})\s+(\d{1,2})\s+[\d:]+\s+.*?(\d{4})', date_content)
+                if match:
+                    month_abbr, day, year = match.groups()
+                    month_map = {'Jan': 1, 'Feb': 2, 'Mar': 3, 'Apr': 4, 'May': 5, 'Jun': 6, 'Jul': 7, 'Aug': 8, 'Sep': 9, 'Oct': 10, 'Nov': 11, 'Dec': 12}
+                    month = month_map.get(month_abbr)
+                    if month:
+                        self.report_date = datetime(int(year), month, int(day))
+                        print(f"✅ sosreport 수집일 감지: {self.report_date.strftime('%Y-%m-%d')}")
+                    else:
+                        raise ValueError(f"알 수 없는 월 약어: {month_abbr}")
+                else:
+                     raise ValueError("인식할 수 없는 날짜 형식")
+            except Exception as e:
+                print(f"⚠️ 경고: sosreport 수집일({date_content}) 파싱 실패: {e}. 오늘 날짜를 기준으로 합니다.")
+                self.report_date = datetime.now()
+        else:
+            print("⚠️ 경고: 'date' 파일을 찾을 수 없어 오늘 날짜 기준으로 sar 파일을 검색합니다.")
+            self.report_date = datetime.now()
+
         self.report_day_str = self.report_date.strftime('%d')
-        self.today_sar_file_pattern = re.compile(f"sar{self.report_day_str}$")
-        self.today_sa_xml_file_pattern = re.compile(f"sa{self.report_day_str}.xml$")
+        self.report_full_date_str = self.report_date.strftime('%Y%m%d')
 
 
     def _read_file(self, possible_paths: List[str], default: str = 'N/A') -> str:
@@ -370,52 +394,57 @@ class SosreportParser:
 
     def _parse_sar_data(self) -> Dict[str, List[Dict[str, Any]]]:
         """
-        여러 경로에서 sar 데이터를 찾아 파싱합니다. XML, 텍스트, 최종 fallback 순으로 시도합니다.
+        명시된 우선순위에 따라 sosreport 수집 당일의 sar 데이터를 찾아 파싱합니다.
         """
         print("sar 성능 데이터 파싱 중...")
         
-        sar_dirs_to_check = ['sos_commands/sar', 'var/log/sa']
-        
-        for dir_name in sar_dirs_to_check:
-            sar_dir = self.base_path / dir_name
-            if not sar_dir.is_dir(): continue
+        # 사용자가 요청한 파일 검색 순서
+        search_paths = [
+            {'path': f'var/log/sa/sar{self.report_day_str}', 'type': 'text'},
+            {'path': f'var/log/sa/sar{self.report_full_date_str}', 'type': 'text'},
+            {'path': f'sos_commands/sar/sar{self.report_day_str}', 'type': 'text'},
+            {'path': f'sos_commands/sar/sa{self.report_day_str}.xml', 'type': 'xml'},
+            {'path': f'sos_commands/sar/sa{self.report_full_date_str}.xml', 'type': 'xml'},
+        ]
 
-            xml_files = sorted([f for f in sar_dir.glob('sa*.xml')], reverse=True)
-            if xml_files and BeautifulSoup:
-                xml_file_path = xml_files[0]
-                print(f"  -> XML sar 데이터 파일 발견: {xml_file_path.relative_to(self.base_path)}")
+        for candidate in search_paths:
+            file_path = self.base_path / candidate['path']
+            file_type = candidate['type']
+
+            if file_path.exists():
+                print(f"  -> 파일 발견. 파싱 시도: {candidate['path']} ({file_type})")
                 try:
-                    content = xml_file_path.read_text(encoding='utf-8', errors='ignore')
-                    soup = BeautifulSoup(content, 'lxml-xml')
-                    
-                    performance_data = self._parse_sar_xml_content(soup)
-                    if any(performance_data.values()):
-                        print("✅ XML sar 데이터 파싱 완료.")
-                        return performance_data
-                except Exception as e:
-                    print(f"⚠️ XML sar 파일({xml_file_path.name}) 파싱 중 오류 발생: {e}. 다음 방법을 시도합니다.")
+                    content = file_path.read_text(encoding='utf-8', errors='ignore')
+                    if not content.strip():
+                        print("    - 파일 내용이 비어있어 건너뜁니다.")
+                        continue
 
-        for dir_name in sar_dirs_to_check:
-            sar_dir = self.base_path / dir_name
-            if not sar_dir.is_dir(): continue
+                    if file_type == 'xml':
+                        if not BeautifulSoup:
+                            print("    - XML 파서(lxml)가 없어 건너뜁니다.")
+                            continue
+                        soup = BeautifulSoup(content, 'lxml-xml')
+                        performance_data = self._parse_sar_xml_content(soup)
+                    else: # text
+                        performance_data = self._parse_sar_text_content(content)
 
-            text_files = sorted([f for f in sar_dir.glob('sar*') if f.name[-2:].isdigit()], reverse=True)
-            if text_files:
-                text_file_path = text_files[0]
-                print(f"  -> 텍스트 sar 데이터 파일 발견: {text_file_path.relative_to(self.base_path)}")
-                try:
-                    content = text_file_path.read_text(encoding='utf-8', errors='ignore')
-                    performance_data = self._parse_sar_text_content(content)
                     if any(performance_data.values()):
+                        print(f"✅ {file_type.upper()} sar 데이터 파싱 성공: {file_path.name}")
                         return performance_data
+                    else:
+                        print(f"    - {file_path.name} 파일에서 유효한 성능 데이터를 추출하지 못했습니다.")
+
                 except Exception as e:
-                    print(f"⚠️ 텍스트 sar 파일({text_file_path.name}) 읽기 오류: {e}")
+                    print(f"⚠️ {file_type.upper()} sar 파일({file_path.name}) 파싱 중 오류 발생: {e}")
         
-        print("  -> 특정 날짜의 sar 파일을 찾지 못했습니다. 종합 sar 데이터(sar -A)로 대체합니다.")
+        print(f"  -> 지정된 형식의 sar 파일을 찾지 못했거나 파싱에 실패했습니다. 종합 sar 데이터(sar -A)로 대체합니다.")
         sar_A_content = self._read_file(['sos_commands/monitoring/sar_-A'])
         if sar_A_content != 'N/A' and sar_A_content.strip():
-            return self._parse_sar_text_content(sar_A_content)
-
+            performance_data = self._parse_sar_text_content(sar_A_content)
+            if any(performance_data.values()):
+                print("✅ 종합 sar 데이터(sar -A) 파싱 완료.")
+                return performance_data
+        
         print("❌ 분석할 수 있는 sar 데이터를 찾지 못했습니다.")
         return {'cpu': [], 'memory': [], 'network': [], 'disk': []}
 
@@ -556,8 +585,6 @@ class SosreportParser:
             for ts, data in disk_agg.items():
                 performance_data['disk'].append({'timestamp': ts, **data})
 
-        if any(performance_data.values()):
-            print("✅ 텍스트 sar 데이터 파싱 완료.")
         return performance_data
 
     def _parse_log_messages(self) -> List[str]:
@@ -898,7 +925,7 @@ class AIAnalyzer:
             print(f"총 {len(all_cves)}개의 CVE 데이터를 Red Hat에서 가져왔습니다.")
             
             now = datetime.now()
-            start_date = now - timedelta(days=180)
+            start_date = now - timedelta(days=365) # 6개월(180일)에서 1년(365일)으로 변경
             
             package_cve_map = {}
             severity_order = {"critical": 2, "important": 1, "moderate": 0, "low": -1}
