@@ -37,13 +37,6 @@ except ImportError:
     matplotlib = None
     plt = None
 
-# --- 웹 스크레이핑 및 XML 파싱을 위한 라이브러리 ---
-# "pip install beautifulsoup4 lxml" 명령어로 설치 필요
-try:
-    from bs4 import BeautifulSoup
-except ImportError:
-    BeautifulSoup = None
-
 class SosreportParser:
     """sosreport 압축 해제 후 디렉토리에서 데이터를 파싱하여 JSON 구조로 만듭니다."""
     def __init__(self, extract_path: str):
@@ -52,30 +45,48 @@ class SosreportParser:
         self.base_path = subdirs[0] if len(subdirs) == 1 else self.extract_path
         print(f"sosreport 데이터 분석 경로: {self.base_path}")
         
-        # sosreport 수집 날짜를 기준으로 sar 파일 패턴 생성
-        date_content = self._read_file(['sos_commands/general/date', 'date'])
         self.report_date = datetime.now() # Fallback
+        date_found = False
 
-        if date_content != 'N/A':
+        # 1. timedatectl 시도 (더 정확한 정보)
+        timedatectl_content = self._read_file(['sos_commands/systemd/timedatectl'])
+        if timedatectl_content != 'N/A':
             try:
-                # 다양한 날짜 형식 파싱 시도 (예: Wed Aug 27 10:50:01 KST 2025)
-                match = re.search(r'([A-Za-z]{3})\s+(\d{1,2})\s+[\d:]+\s+.*?(\d{4})', date_content)
+                # 예: Local time: Mon 2025-09-01 15:04:00 KST
+                match = re.search(r'Local time:.*?(\d{4}-\d{2}-\d{2})', timedatectl_content)
                 if match:
-                    month_abbr, day, year = match.groups()
-                    month_map = {'Jan': 1, 'Feb': 2, 'Mar': 3, 'Apr': 4, 'May': 5, 'Jun': 6, 'Jul': 7, 'Aug': 8, 'Sep': 9, 'Oct': 10, 'Nov': 11, 'Dec': 12}
-                    month = month_map.get(month_abbr)
-                    if month:
-                        self.report_date = datetime(int(year), month, int(day))
-                        print(f"✅ sosreport 수집일 감지: {self.report_date.strftime('%Y-%m-%d')}")
-                    else:
-                        raise ValueError(f"알 수 없는 월 약어: {month_abbr}")
+                    self.report_date = datetime.strptime(match.group(1), '%Y-%m-%d')
+                    print(f"✅ sosreport 수집일 감지 (timedatectl): {self.report_date.strftime('%Y-%m-%d')}")
+                    date_found = True
                 else:
-                     raise ValueError("인식할 수 없는 날짜 형식")
+                    raise ValueError("timedatectl에서 'Local time'을 찾을 수 없음")
             except Exception as e:
-                print(f"⚠️ 경고: sosreport 수집일({date_content}) 파싱 실패: {e}. 오늘 날짜를 기준으로 합니다.")
-                self.report_date = datetime.now()
-        else:
-            print("⚠️ 경고: 'date' 파일을 찾을 수 없어 오늘 날짜 기준으로 sar 파일을 검색합니다.")
+                print(f"⚠️ 경고: timedatectl 파싱 실패: {e}. 다른 파일을 시도합니다.")
+
+        # 2. date 파일 시도 (timedatectl 실패 또는 파일 부재 시)
+        if not date_found:
+            date_content = self._read_file(['sos_commands/date/date', 'sos_commands/general/date', 'date'])
+            if date_content != 'N/A':
+                try:
+                    # 예: Mon Sep 1 15:04:00 KST 2025
+                    match = re.search(r'([A-Za-z]{3})\s+[A-Za-z]{3}\s+(\d{1,2})\s+[\d:]+\s+.*?(\d{4})', date_content)
+                    if match:
+                        month_abbr, day, year = match.groups()
+                        month_map = {'Jan': 1, 'Feb': 2, 'Mar': 3, 'Apr': 4, 'May': 5, 'Jun': 6, 'Jul': 7, 'Aug': 8, 'Sep': 9, 'Oct': 10, 'Nov': 11, 'Dec': 12}
+                        month = month_map.get(month_abbr)
+                        if month:
+                            self.report_date = datetime(int(year), month, int(day))
+                            print(f"✅ sosreport 수집일 감지 (date): {self.report_date.strftime('%Y-%m-%d')}")
+                            date_found = True
+                        else:
+                            raise ValueError(f"알 수 없는 월 약어: {month_abbr}")
+                    else:
+                         raise ValueError("인식할 수 없는 날짜 형식")
+                except Exception as e:
+                    print(f"⚠️ 경고: date 파일({date_content}) 파싱 실패: {e}.")
+        
+        if not date_found:
+            print("⚠️ 경고: 'date' 또는 'timedatectl' 파일을 찾거나 파싱할 수 없어 오늘 날짜 기준으로 sar 파일을 검색합니다.")
             self.report_date = datetime.now()
 
         self.report_day_str = self.report_date.strftime('%d')
@@ -394,198 +405,168 @@ class SosreportParser:
 
     def _parse_sar_data(self) -> Dict[str, List[Dict[str, Any]]]:
         """
-        명시된 우선순위에 따라 sosreport 수집 당일의 sar 데이터를 찾아 파싱합니다.
+        명시된 우선순위에 따라 sosreport 수집 당일의 텍스트 기반 sar 데이터를 찾아 파싱합니다.
         """
         print("sar 성능 데이터 파싱 중...")
         
-        # 사용자가 요청한 파일 검색 순서
         search_paths = [
-            {'path': f'var/log/sa/sar{self.report_day_str}', 'type': 'text'},
-            {'path': f'var/log/sa/sar{self.report_full_date_str}', 'type': 'text'},
-            {'path': f'sos_commands/sar/sar{self.report_day_str}', 'type': 'text'},
-            {'path': f'sos_commands/sar/sa{self.report_day_str}.xml', 'type': 'xml'},
-            {'path': f'sos_commands/sar/sa{self.report_full_date_str}.xml', 'type': 'xml'},
+            {'path': f'sos_commands/sar/sar{self.report_day_str}'},
+            {'path': f'sos_commands/sar/sar{self.report_full_date_str}'},
+            {'path': f'var/log/sa/sar{self.report_day_str}'},
+            {'path': f'var/log/sa/sar{self.report_full_date_str}'},
         ]
 
         for candidate in search_paths:
             file_path = self.base_path / candidate['path']
-            file_type = candidate['type']
-
+            
             if file_path.exists():
-                print(f"  -> 파일 발견. 파싱 시도: {candidate['path']} ({file_type})")
+                print(f"  -> 파일 발견. 파싱 시도: {candidate['path']} (text)")
                 try:
                     content = file_path.read_text(encoding='utf-8', errors='ignore')
                     if not content.strip():
                         print("    - 파일 내용이 비어있어 건너뜁니다.")
                         continue
 
-                    if file_type == 'xml':
-                        if not BeautifulSoup:
-                            print("    - XML 파서(lxml)가 없어 건너뜁니다.")
-                            continue
-                        soup = BeautifulSoup(content, 'lxml-xml')
-                        performance_data = self._parse_sar_xml_content(soup)
-                    else: # text
-                        performance_data = self._parse_sar_text_content(content)
+                    performance_data = self._parse_sar_text_content(content)
 
-                    if any(performance_data.values()):
-                        print(f"✅ {file_type.upper()} sar 데이터 파싱 성공: {file_path.name}")
+                    if any(v for v in performance_data.values() if v):
+                        num_cpu = len(performance_data.get('cpu', []))
+                        num_mem = len(performance_data.get('memory', []))
+                        # Network and disk are lists of dicts, we need to count unique timestamps
+                        num_net = len(set(d['timestamp'] for d in performance_data.get('network', [])))
+                        num_disk = len(set(d['timestamp'] for d in performance_data.get('disk', [])))
+                        num_load = len(performance_data.get('load', []))
+                        print(f"✅ 텍스트 sar 데이터 파싱 성공: {file_path.name} "
+                              f"(CPU: {num_cpu}, Mem: {num_mem}, Net: {num_net}, Disk: {num_disk}, Load: {num_load})")
                         return performance_data
                     else:
                         print(f"    - {file_path.name} 파일에서 유효한 성능 데이터를 추출하지 못했습니다.")
 
                 except Exception as e:
-                    print(f"⚠️ {file_type.upper()} sar 파일({file_path.name}) 파싱 중 오류 발생: {e}")
-        
+                    print(f"⚠️ 텍스트 sar 파일({file_path.name}) 파싱 중 오류 발생: {e}")
+    
         print(f"  -> 지정된 형식의 sar 파일을 찾지 못했거나 파싱에 실패했습니다. 종합 sar 데이터(sar -A)로 대체합니다.")
         sar_A_content = self._read_file(['sos_commands/monitoring/sar_-A'])
         if sar_A_content != 'N/A' and sar_A_content.strip():
             performance_data = self._parse_sar_text_content(sar_A_content)
             if any(performance_data.values()):
-                print("✅ 종합 sar 데이터(sar -A) 파싱 완료.")
+                num_cpu = len(performance_data.get('cpu', []))
+                num_mem = len(performance_data.get('memory', []))
+                num_net = len(set(d['timestamp'] for d in performance_data.get('network', [])))
+                num_disk = len(set(d['timestamp'] for d in performance_data.get('disk', [])))
+                num_load = len(performance_data.get('load', []))
+                print(f"✅ 종합 sar 데이터(sar -A) 파싱 완료. "
+                      f"(CPU: {num_cpu}, Mem: {num_mem}, Net: {num_net}, Disk: {num_disk}, Load: {num_load})")
                 return performance_data
         
         print("❌ 분석할 수 있는 sar 데이터를 찾지 못했습니다.")
-        return {'cpu': [], 'memory': [], 'network': [], 'disk': []}
-
-    def _parse_sar_xml_content(self, soup: BeautifulSoup) -> Dict:
-        """BeautifulSoup 객체에서 sar 성능 데이터를 추출합니다."""
-        performance_data = {'cpu': [], 'memory': [], 'network': [], 'disk': []}
-        stats = soup.find_all('statistic')
-        for stat in stats:
-            time_str = stat.get('time', '00:00:00')
-            ampm_str = stat.get('ampm', '')
-            timestamp = f"{time_str} {ampm_str}".strip()
-            
-            cpu_load = stat.find('cpu-load', {'cpu': 'all'})
-            if cpu_load:
-                performance_data['cpu'].append({
-                    'timestamp': timestamp, 'user': float(cpu_load.find('user').text),
-                    'system': float(cpu_load.find('system').text), 'iowait': float(cpu_load.find('iowait').text),
-                    'idle': float(cpu_load.find('idle').text)
-                })
-
-            memory = stat.find('memory')
-            if memory and memory.find('memused-percent'):
-                performance_data['memory'].append({
-                    'timestamp': timestamp, 'memused_percent': float(memory.find('memused-percent').text)
-                })
-
-            network = stat.find('network')
-            if network:
-                net_agg = {'rxkB': 0.0, 'txkB': 0.0}
-                for dev in network.find_all('net-dev'):
-                    if dev.get('iface') != 'lo':
-                        net_agg['rxkB'] += float(dev.find('rx-kB').text) if dev.find('rx-kB') else 0.0
-                        net_agg['txkB'] += float(dev.find('tx-kB').text) if dev.find('tx-kB') else 0.0
-                if net_agg['rxkB'] > 0 or net_agg['txkB'] > 0:
-                        performance_data['network'].append({'timestamp': timestamp, **net_agg})
-
-            disk = stat.find('disk')
-            if disk:
-                disk_agg = {'read_kB': 0.0, 'write_kB': 0.0, 'util_percent': 0.0}
-                for dev in disk.find_all('io'):
-                    disk_agg['read_kB'] += float(dev.find('read-kB').text) if dev.find('read-kB') else 0.0
-                    disk_agg['write_kB'] += float(dev.find('write-kB').text) if dev.find('write-kB') else 0.0
-                    disk_agg['util_percent'] += float(dev.find('util-percent').text) if dev.find('util-percent') else 0.0
-                if disk_agg['read_kB'] > 0 or disk_agg['write_kB'] > 0:
-                    performance_data['disk'].append({'timestamp': timestamp, **disk_agg})
-        return performance_data
+        return {'cpu': [], 'memory': [], 'network': [], 'disk': [], 'load': []}
 
     def _parse_sar_text_content(self, sar_content: str) -> Dict[str, List[Dict[str, Any]]]:
-        """주어진 sar 텍스트 내용을 파싱합니다."""
-        performance_data = {'cpu': [], 'memory': [], 'network': [], 'disk': []}
+        """ksar의 원리를 적용하여, 헤더와 데이터 라인을 지능적으로 식별하고 상세 데이터를 파싱합니다."""
+        performance_data = {
+            'cpu': [], 'memory': [], 'network': [], 'disk': [], 'load': []
+        }
+        context = {'section': None, 'header_map': {}}
 
-        cpu_section = re.search(r'(\d{2}:\d{2}:\d{2}\s+(?:AM|PM)?\s+CPU\s+%user\s+%nice\s+%system\s+%iowait\s+%steal\s+%idle\n(?:.*\n)+?)(?=\n\n|\Z)', sar_content, re.MULTILINE)
-        if cpu_section:
-            for line in cpu_section.group(1).strip().split('\n'):
-                parts = line.split()
-                if len(parts) < 8 or not parts[0][0].isdigit(): continue
+        lines = sar_content.split('\n')
+        for line in lines:
+            line = line.strip()
+            if not line or 'Linux' in line or 'Average:' in line:
+                context['section'] = None
+                continue
 
-                ts_parts, data_parts = [], []
-                for part in parts:
-                    if ':' in part or part in ('AM', 'PM'): ts_parts.append(part)
-                    elif re.match(r'^[0-9.]+$', part) or part == 'all': data_parts.append(part)
+            ts_match = re.match(r'(\d{2}:\d{2}:\d{2}(?:\s+(?:AM|PM))?)', line)
+            if not ts_match:
+                continue
+            
+            timestamp = ts_match.group(1)
+            parts = line.split()
 
-                if 'all' not in data_parts: continue
+            # Determine if the line is a header
+            is_header = False
+            # Header lines have specific keyword combinations and mostly non-numeric parts after the timestamp
+            non_ts_parts = line[len(timestamp):].strip().split()
+            if any(p.isalpha() for p in non_ts_parts):
+                 if ('CPU' in parts and '%usr' in parts) or \
+                   ('IFACE' in parts and 'rxpck/s' in parts) or \
+                   ('kbmemfree' in parts and '%memused' in parts) or \
+                   ('tps' in parts and 'bread/s' in parts) or \
+                   ('DEV' in parts and 'tps' in parts) or \
+                   ('runq-sz' in parts and 'ldavg-1' in parts):
+                    is_header = True
+
+            if is_header:
+                if 'CPU' in parts and '%usr' in parts: context['section'] = 'cpu'
+                elif 'IFACE' in parts and 'rxpck/s' in parts: context['section'] = 'net'
+                elif 'kbmemfree' in parts: context['section'] = 'mem'
+                elif 'tps' in parts and 'bread/s' in parts: context['section'] = 'disk_b'
+                elif 'DEV' in parts and 'tps' in parts: context['section'] = 'disk_d'
+                elif 'ldavg-1' in parts: context['section'] = 'load'
+                else: context['section'] = None
                 
-                try:
-                    timestamp = ' '.join(ts_parts)
-                    user_idx = data_parts.index('all') + 1
+                if context['section']:
+                    context['header_map'] = {header.replace('/', '_s'): i for i, header in enumerate(parts)}
+                continue
+
+            if not context.get('section') or not context.get('header_map'):
+                continue
+            
+            h_map = context['header_map']
+            try:
+                entry = {'timestamp': timestamp}
+                data_parts = parts[len(timestamp.split()):] # Get parts after the timestamp
+                header_keys = sorted(h_map, key=h_map.get) # Get headers in order
+                
+                # Find the starting index of actual data based on header
+                # This handles cases like 'all', 'eth0' etc.
+                start_data_idx = 0
+                for i, p in enumerate(data_parts):
+                    if p.replace('.', '', 1).isdigit():
+                        start_data_idx = i
+                        break
+
+                key_offset = h_map[header_keys[start_data_idx + len(timestamp.split())]] - start_data_idx
+                
+                for key, index in h_map.items():
+                    data_idx = index - key_offset
+                    if 0 <= data_idx < len(data_parts):
+                        entry[key] = data_parts[data_idx]
+                
+                if 'IFACE' in h_map: entry['IFACE'] = data_parts[h_map['IFACE'] - key_offset]
+                if 'DEV' in h_map: entry['DEV'] = data_parts[h_map['DEV'] - key_offset]
+
+
+                if context['section'] == 'cpu' and 'all' in parts:
                     performance_data['cpu'].append({
-                        'timestamp': timestamp, 'user': float(data_parts[user_idx]), 
-                        'system': float(data_parts[user_idx+2]), 'iowait': float(data_parts[user_idx+3]), 
-                        'idle': float(data_parts[user_idx+5])
+                        'timestamp': timestamp,
+                        'user': float(entry.get('%usr', entry.get('%user', 0))),
+                        'system': float(entry.get('%sys', entry.get('%system', 0))),
+                        'iowait': float(entry.get('%iowait', 0)),
+                        'idle': float(entry.get('%idle', 0))
                     })
-                except (ValueError, IndexError): continue
+                elif context['section'] == 'mem':
+                    performance_data['memory'].append(entry)
 
-        mem_section = re.search(r'(\d{2}:\d{2}:\d{2}\s+(?:AM|PM)?\s+kbmemfree\s+kbmemused\s+%memused\s+kbbuffers\s+kbcached\s+kbcommit\s+%commit\n(?:.*\n)+?)(?=\n\n|\Z)', sar_content, re.MULTILINE)
-        if mem_section:
-            for line in mem_section.group(1).strip().split('\n'):
-                parts = line.split()
-                if len(parts) < 5 or not parts[0][0].isdigit(): continue
-                
-                ts_parts, data_parts = [], []
-                for part in parts:
-                    if ':' in part or part in ('AM', 'PM'): ts_parts.append(part)
-                    elif re.match(r'^[0-9.]+$', part): data_parts.append(part)
+                elif context['section'] == 'net' and entry.get('IFACE') != 'lo':
+                    performance_data['network'].append(entry)
 
-                if len(data_parts) < 3: continue
+                elif context['section'] in ['disk_b', 'disk_d']:
+                    performance_data['disk'].append(entry)
 
-                try:
-                    timestamp = ' '.join(ts_parts)
-                    performance_data['memory'].append({'timestamp': timestamp, 'memused_percent': float(data_parts[2])})
-                except (ValueError, IndexError): continue
-
-        net_section = re.search(r'(\d{2}:\d{2}:\d{2}\s+(?:AM|PM)?\s+IFACE\s+rxpck/s\s+txpck/s\s+rxkB/s\s+txkB/s\s+rxcmp/s\s+txcmp/s\s+rxmcst/s\n(?:.*\n)+?)(?=\n\n|\Z)', sar_content, re.MULTILINE)
-        if net_section:
-            net_agg = {}
-            for line in net_section.group(1).strip().split('\n'):
-                parts = line.split()
-                if len(parts) < 7 or not parts[0][0].isdigit(): continue
-
-                ts_parts, data_parts, iface = [], [], ''
-                for part in parts:
-                    if ':' in part or part in ('AM', 'PM'): ts_parts.append(part)
-                    elif re.match(r'^[a-zA-Z0-9.-]+$', part) and not part.replace('.','',1).isdigit(): iface = part
-                    elif re.match(r'^[0-9./]+$', part): data_parts.append(part)
-
-                if iface in ('lo', 'IFACE') or not iface: continue
-                
-                try:
-                    timestamp = ' '.join(ts_parts)
-                    if timestamp not in net_agg: net_agg[timestamp] = {'rxkB': 0.0, 'txkB': 0.0}
-                    net_agg[timestamp]['rxkB'] += float(data_parts[2])
-                    net_agg[timestamp]['txkB'] += float(data_parts[3])
-                except (ValueError, IndexError): continue
-            for ts, data in net_agg.items():
-                performance_data['network'].append({'timestamp': ts, **data})
+                elif context['section'] == 'load':
+                    performance_data['load'].append({
+                        'timestamp': timestamp,
+                        'ldavg-1': float(entry.get('ldavg-1', 0)),
+                        'ldavg-5': float(entry.get('ldavg-5', 0)),
+                        'ldavg-15': float(entry.get('ldavg-15', 0))
+                    })
+            except (ValueError, IndexError, KeyError) as e:
+                # print(f"DEBUG: Skipping line due to error: {e} | Line: '{line}' | Context: {context}")
+                continue
         
-        disk_section = re.search(r'(\d{2}:\d{2}:\d{2}\s+(?:AM|PM)?\s+DEV\s+tps\s+rkB/s\s+wkB/s\s+areq-sz\s+aqu-sz\s+await\s+%util\n(?:.*\n)+?)(?=\n\n|\Z)', sar_content, re.MULTILINE)
-        if disk_section:
-            disk_agg = {}
-            for line in disk_section.group(1).strip().split('\n'):
-                parts = line.split()
-                if len(parts) < 9 or not parts[0][0].isdigit(): continue
-                
-                ts_parts, data_parts = [], []
-                for part in parts:
-                    if ':' in part or part in ('AM', 'PM'): ts_parts.append(part)
-                    elif re.match(r'^[0-9.]+$', part): data_parts.append(part)
-
-                if len(data_parts) < 8: continue
-                
-                try:
-                    timestamp = ' '.join(ts_parts)
-                    if timestamp not in disk_agg: disk_agg[timestamp] = {'read_kB': 0.0, 'write_kB': 0.0, 'util_percent': 0.0}
-                    disk_agg[timestamp]['read_kB'] += float(data_parts[1])
-                    disk_agg[timestamp]['write_kB'] += float(data_parts[2])
-                    disk_agg[timestamp]['util_percent'] += float(data_parts[7])
-                except (ValueError, IndexError): continue
-            for ts, data in disk_agg.items():
-                performance_data['disk'].append({'timestamp': ts, **data})
-
         return performance_data
+
 
     def _parse_log_messages(self) -> List[str]:
         log_content = self._read_file(['var/log/messages', 'var/log/syslog'])
@@ -925,7 +906,7 @@ class AIAnalyzer:
             print(f"총 {len(all_cves)}개의 CVE 데이터를 Red Hat에서 가져왔습니다.")
             
             now = datetime.now()
-            start_date = now - timedelta(days=365) # 6개월(180일)에서 1년(365일)으로 변경
+            start_date = now - timedelta(days=365)
             
             package_cve_map = {}
             severity_order = {"critical": 2, "important": 1, "moderate": 0, "low": -1}
@@ -1102,7 +1083,7 @@ class AIAnalyzer:
             return [{"reason": f"보안 뉴스 조회 중 오류가 발생했습니다: {e}"}]
 
     def create_performance_graphs(self, perf_data: Dict[str, List[Dict[str, Any]]]) -> Dict[str, str]:
-        """성능 데이터를 바탕으로 세련된 스타일의 그래프를 생성하고 base64로 인코딩하여 반환합니다."""
+        """성능 데이터를 바탕으로 CPU, Memory, Network, Disk I/O, Load Average 그래프를 생성합니다."""
         if not plt:
             print("⚠️ 그래프 생성을 건너뜁니다. 'matplotlib' 라이브러리를 설치하세요.")
             return {}
@@ -1111,122 +1092,180 @@ class AIAnalyzer:
         graphs = {}
         plt.style.use('seaborn-v0_8-whitegrid')
 
-        # --- 공통 스타일 설정 ---
         graph_style = {
-            'figsize': (12, 6),
-            'title_fontsize': 16,
-            'label_fontsize': 12,
-            'tick_rotation': 30,
-            'alpha': 0.3
+            'figsize': (12, 6), 'title_fontsize': 16, 'label_fontsize': 12,
+            'tick_rotation': 30, 'alpha': 0.3
         }
         
         # --- CPU 그래프 ---
         if perf_data.get('cpu') and len(perf_data['cpu']) > 1:
-            cpu_data = perf_data['cpu']
-            timestamps = [d['timestamp'] for d in cpu_data]
-            user = [d['user'] for d in cpu_data]
-            system = [d['system'] for d in cpu_data]
-            iowait = [d['iowait'] for d in cpu_data]
-            
-            fig, ax = plt.subplots(figsize=graph_style['figsize'])
-            colors = ['#4C72B0', '#DD8452', '#C44E52']
-            ax.stackplot(timestamps, user, system, iowait, 
-                         labels=['User %', 'System %', 'I/O Wait %'], 
-                         colors=colors, alpha=0.7)
-            
-            ax.set_title('CPU 사용률 (%)', fontsize=graph_style['title_fontsize'], weight='bold')
-            ax.set_ylabel('사용률 (%)', fontsize=graph_style['label_fontsize'])
-            ax.legend(loc='upper left', frameon=True, facecolor='white', framealpha=0.8)
-            ax.set_ylim(0, 100)
-            ax.xaxis.set_major_locator(mticker.MaxNLocator(nbins=10, prune='both'))
-            plt.xticks(rotation=graph_style['tick_rotation'], ha='right')
-            plt.tight_layout()
-            
-            buf = io.BytesIO()
-            fig.savefig(buf, format='png', dpi=100)
-            graphs['cpu_graph'] = base64.b64encode(buf.getvalue()).decode('utf-8')
-            plt.close(fig)
+            try:
+                cpu_data, timestamps = perf_data['cpu'], [d['timestamp'] for d in perf_data['cpu']]
+                user, system, iowait = [d['user'] for d in cpu_data], [d['system'] for d in cpu_data], [d['iowait'] for d in cpu_data]
+                
+                fig, ax = plt.subplots(figsize=graph_style['figsize'])
+                ax.stackplot(timestamps, user, system, iowait, 
+                             labels=['User %', 'System %', 'I/O Wait %'], 
+                             colors=['#4C72B0', '#DD8452', '#C44E52'], alpha=0.7)
+                
+                ax.set_title('CPU 사용률 (%)', fontsize=graph_style['title_fontsize'], weight='bold')
+                ax.set_ylabel('사용률 (%)', fontsize=graph_style['label_fontsize'])
+                ax.legend(loc='upper left', frameon=True)
+                ax.set_ylim(0, 100)
+                ax.xaxis.set_major_locator(mticker.MaxNLocator(nbins=10, prune='both'))
+                plt.xticks(rotation=graph_style['tick_rotation'], ha='right')
+                plt.tight_layout()
+                
+                buf = io.BytesIO()
+                fig.savefig(buf, format='png', dpi=100)
+                graphs['cpu_graph'] = base64.b64encode(buf.getvalue()).decode('utf-8')
+                plt.close(fig)
+                print("  - CPU 그래프 생성 완료")
+            except Exception as e:
+                print(f"  - ⚠️ CPU 그래프 생성 실패: {e}")
 
-        # --- 메모리 그래프 ---
+        # --- 메모리(RAM) 그래프 ---
         if perf_data.get('memory') and len(perf_data['memory']) > 1:
-            mem_data = perf_data['memory']
-            timestamps = [d['timestamp'] for d in mem_data]
-            mem_used = [d['memused_percent'] for d in mem_data]
-            
-            fig, ax = plt.subplots(figsize=graph_style['figsize'])
-            color = '#C44E52'
-            ax.plot(timestamps, mem_used, color=color, lw=2)
-            ax.fill_between(timestamps, mem_used, color=color, alpha=graph_style['alpha'])
+            try:
+                mem_data, timestamps = perf_data['memory'], [d['timestamp'] for d in perf_data['memory']]
+                mem_used = [float(d.get('%memused', 0)) for d in mem_data]
+                
+                fig, ax = plt.subplots(figsize=graph_style['figsize'])
+                ax.plot(timestamps, mem_used, color='#55A868', lw=2)
+                ax.fill_between(timestamps, mem_used, color='#55A868', alpha=graph_style['alpha'])
 
-            ax.set_title('메모리 사용률 (%)', fontsize=graph_style['title_fontsize'], weight='bold')
-            ax.set_ylabel('사용률 (%)', fontsize=graph_style['label_fontsize'])
-            ax.set_ylim(0, 100)
-            ax.xaxis.set_major_locator(mticker.MaxNLocator(nbins=10, prune='both'))
-            plt.xticks(rotation=graph_style['tick_rotation'], ha='right')
-            plt.tight_layout()
+                ax.set_title('메모리 사용률 (%)', fontsize=graph_style['title_fontsize'], weight='bold')
+                ax.set_ylabel('사용률 (%)', fontsize=graph_style['label_fontsize'])
+                ax.set_ylim(0, 100)
+                ax.xaxis.set_major_locator(mticker.MaxNLocator(nbins=10, prune='both'))
+                plt.xticks(rotation=graph_style['tick_rotation'], ha='right')
+                plt.tight_layout()
 
-            buf = io.BytesIO()
-            fig.savefig(buf, format='png', dpi=100)
-            graphs['memory_graph'] = base64.b64encode(buf.getvalue()).decode('utf-8')
-            plt.close(fig)
+                buf = io.BytesIO()
+                fig.savefig(buf, format='png', dpi=100)
+                graphs['memory_graph'] = base64.b64encode(buf.getvalue()).decode('utf-8')
+                plt.close(fig)
+                print("  - 메모리 그래프 생성 완료")
+            except Exception as e:
+                print(f"  - ⚠️ 메모리 그래프 생성 실패: {e}")
 
-        # --- 네트워크 그래프 ---
+        # --- 네트워크 그래프 (개선된 로직) ---
         if perf_data.get('network') and len(perf_data['network']) > 1:
-            net_data = perf_data['network']
-            timestamps = [d['timestamp'] for d in net_data]
-            rxkB = [d['rxkB'] for d in net_data]
-            txkB = [d['txkB'] for d in net_data]
+            try:
+                net_agg = {}
+                for d in perf_data['network']:
+                    ts = d['timestamp']
+                    if ts not in net_agg: net_agg[ts] = {'rx_kb': 0.0, 'tx_kb': 0.0}
+                    
+                    # 여러 가능한 키 이름을 확인 ('rxkB/s' -> 'rxkB_s', 'rkB/s' -> 'rkB_s')
+                    rx_val = d.get('rxkB_s', d.get('rkB_s'))
+                    tx_val = d.get('txkB_s', d.get('tkB_s'))
 
-            fig, ax = plt.subplots(figsize=graph_style['figsize'])
-            rx_color, tx_color = '#55A868', '#4C72B0'
-            
-            ax.plot(timestamps, rxkB, color=rx_color, lw=2, label='수신 (kB/s)')
-            ax.fill_between(timestamps, rxkB, color=rx_color, alpha=graph_style['alpha'])
-            
-            ax.plot(timestamps, txkB, color=tx_color, lw=2, label='송신 (kB/s)')
-            ax.fill_between(timestamps, txkB, color=tx_color, alpha=graph_style['alpha'])
+                    if rx_val is not None: net_agg[ts]['rx_kb'] += float(rx_val)
+                    if tx_val is not None: net_agg[ts]['tx_kb'] += float(tx_val)
+                
+                net_data = sorted([{'timestamp': ts, **data} for ts, data in net_agg.items()], key=lambda x: x['timestamp'])
+                timestamps = [d['timestamp'] for d in net_data]
+                rxkB, txkB = [d['rx_kb'] for d in net_data], [d['tx_kb'] for d in net_data]
 
-            ax.set_title('네트워크 트래픽 (kB/s)', fontsize=graph_style['title_fontsize'], weight='bold')
-            ax.set_ylabel('kB/s', fontsize=graph_style['label_fontsize'])
-            ax.legend(loc='upper left', frameon=True, facecolor='white', framealpha=0.8)
-            ax.xaxis.set_major_locator(mticker.MaxNLocator(nbins=10, prune='both'))
-            plt.xticks(rotation=graph_style['tick_rotation'], ha='right')
-            plt.tight_layout()
+                fig, ax = plt.subplots(figsize=graph_style['figsize'])
+                ax.plot(timestamps, rxkB, color='#8172B3', lw=2, label='수신 (kB/s)')
+                ax.fill_between(timestamps, rxkB, color='#8172B3', alpha=graph_style['alpha'])
+                ax.plot(timestamps, txkB, color='#CCB974', lw=2, label='송신 (kB/s)')
+                ax.fill_between(timestamps, txkB, color='#CCB974', alpha=graph_style['alpha'])
 
-            buf = io.BytesIO()
-            fig.savefig(buf, format='png', dpi=100)
-            graphs['network_graph'] = base64.b64encode(buf.getvalue()).decode('utf-8')
-            plt.close(fig)
+                ax.set_title('네트워크 트래픽 (kB/s)', fontsize=graph_style['title_fontsize'], weight='bold')
+                ax.set_ylabel('kB/s', fontsize=graph_style['label_fontsize'])
+                ax.legend(loc='upper left', frameon=True)
+                ax.xaxis.set_major_locator(mticker.MaxNLocator(nbins=10, prune='both'))
+                plt.xticks(rotation=graph_style['tick_rotation'], ha='right')
+                plt.tight_layout()
 
-        # --- 디스크 I/O 그래프 ---
+                buf = io.BytesIO()
+                fig.savefig(buf, format='png', dpi=100)
+                graphs['network_graph'] = base64.b64encode(buf.getvalue()).decode('utf-8')
+                plt.close(fig)
+                print("  - 네트워크 그래프 생성 완료")
+            except Exception as e:
+                print(f"  - ⚠️ 네트워크 그래프 생성 실패: {e}")
+
+        # --- 디스크 I/O 그래프 (개선된 로직) ---
         if perf_data.get('disk') and len(perf_data['disk']) > 1:
-            disk_data = perf_data['disk']
-            timestamps = [d['timestamp'] for d in disk_data]
-            read_kB = [d['read_kB'] for d in disk_data]
-            write_kB = [d['write_kB'] for d in disk_data]
+            try:
+                disk_agg = {}
+                for d in perf_data['disk']:
+                    ts = d['timestamp']
+                    if ts not in disk_agg: disk_agg[ts] = {'read_kb': 0.0, 'write_kb': 0.0}
 
-            fig, ax = plt.subplots(figsize=graph_style['figsize'])
-            read_color, write_color = '#8172B3', '#DD8452'
+                    # bread/s, bwrtn/s (블록) -> kB/s 변환 (1 block = 512 bytes = 0.5 kB)
+                    # rkB/s, wkB/s 는 그대로 사용
+                    read_val_block = d.get('bread_s')
+                    write_val_block = d.get('bwrtn_s')
+                    
+                    if read_val_block is not None:
+                        disk_agg[ts]['read_kb'] += float(read_val_block) * 0.5
+                    else:
+                        read_val_kb = d.get('rkB_s')
+                        if read_val_kb is not None: disk_agg[ts]['read_kb'] += float(read_val_kb)
 
-            ax.plot(timestamps, read_kB, color=read_color, lw=2, label='읽기 (kB/s)')
-            ax.fill_between(timestamps, read_kB, color=read_color, alpha=graph_style['alpha'])
-            
-            ax.plot(timestamps, write_kB, color=write_color, lw=2, label='쓰기 (kB/s)')
-            ax.fill_between(timestamps, write_kB, color=write_color, alpha=graph_style['alpha'])
+                    if write_val_block is not None:
+                         disk_agg[ts]['write_kb'] += float(write_val_block) * 0.5
+                    else:
+                        write_val_kb = d.get('wkB_s')
+                        if write_val_kb is not None: disk_agg[ts]['write_kb'] += float(write_val_kb)
 
-            ax.set_title('디스크 I/O (kB/s)', fontsize=graph_style['title_fontsize'], weight='bold')
-            ax.set_ylabel('kB/s', fontsize=graph_style['label_fontsize'])
-            ax.legend(loc='upper left', frameon=True, facecolor='white', framealpha=0.8)
-            ax.xaxis.set_major_locator(mticker.MaxNLocator(nbins=10, prune='both'))
-            plt.xticks(rotation=graph_style['tick_rotation'], ha='right')
-            plt.tight_layout()
+                disk_data = sorted([{'timestamp': ts, **data} for ts, data in disk_agg.items()], key=lambda x: x['timestamp'])
+                timestamps = [d['timestamp'] for d in disk_data]
+                read_kB, write_kB = [d['read_kb'] for d in disk_data], [d['write_kb'] for d in disk_data]
 
-            buf = io.BytesIO()
-            fig.savefig(buf, format='png', dpi=100)
-            graphs['disk_graph'] = base64.b64encode(buf.getvalue()).decode('utf-8')
-            plt.close(fig)
+                fig, ax = plt.subplots(figsize=graph_style['figsize'])
+                ax.plot(timestamps, read_kB, color='#64B5CD', lw=2, label='읽기 (kB/s)')
+                ax.fill_between(timestamps, read_kB, color='#64B5CD', alpha=graph_style['alpha'])
+                ax.plot(timestamps, write_kB, color='#C44E52', lw=2, label='쓰기 (kB/s)')
+                ax.fill_between(timestamps, write_kB, color='#C44E52', alpha=graph_style['alpha'])
 
-        print("✅ 성능 그래프 생성 완료.")
+                ax.set_title('디스크 I/O (kB/s)', fontsize=graph_style['title_fontsize'], weight='bold')
+                ax.set_ylabel('kB/s', fontsize=graph_style['label_fontsize'])
+                ax.legend(loc='upper left', frameon=True)
+                ax.xaxis.set_major_locator(mticker.MaxNLocator(nbins=10, prune='both'))
+                plt.xticks(rotation=graph_style['tick_rotation'], ha='right')
+                plt.tight_layout()
+
+                buf = io.BytesIO()
+                fig.savefig(buf, format='png', dpi=100)
+                graphs['disk_graph'] = base64.b64encode(buf.getvalue()).decode('utf-8')
+                plt.close(fig)
+                print("  - 디스크 I/O 그래프 생성 완료")
+            except Exception as e:
+                print(f"  - ⚠️ 디스크 I/O 그래프 생성 실패: {e}")
+        
+        # --- Load Average 그래프 ---
+        if perf_data.get('load') and len(perf_data['load']) > 1:
+            try:
+                load_data, timestamps = perf_data['load'], [d['timestamp'] for d in perf_data['load']]
+                ldavg_1, ldavg_5, ldavg_15 = [d['ldavg-1'] for d in load_data], [d['ldavg-5'] for d in load_data], [d['ldavg-15'] for d in load_data]
+
+                fig, ax = plt.subplots(figsize=graph_style['figsize'])
+                ax.plot(timestamps, ldavg_1, label='Load Avg (1 min)', color='#4C72B0')
+                ax.plot(timestamps, ldavg_5, label='Load Avg (5 min)', color='#55A868')
+                ax.plot(timestamps, ldavg_15, label='Load Avg (15 min)', color='#C44E52')
+
+                ax.set_title('System Load Average', fontsize=graph_style['title_fontsize'], weight='bold')
+                ax.set_ylabel('Load', fontsize=graph_style['label_fontsize'])
+                ax.legend(loc='upper left', frameon=True)
+                ax.xaxis.set_major_locator(mticker.MaxNLocator(nbins=10, prune='both'))
+                plt.xticks(rotation=graph_style['tick_rotation'], ha='right')
+                plt.tight_layout()
+
+                buf = io.BytesIO()
+                fig.savefig(buf, format='png', dpi=100)
+                graphs['load_average_graph'] = base64.b64encode(buf.getvalue()).decode('utf-8')
+                plt.close(fig)
+                print("  - Load Average 그래프 생성 완료")
+            except Exception as e:
+                print(f"  - ⚠️ Load Average 그래프 생성 실패: {e}")
+
+        print("✅ 모든 성능 그래프 생성 시도 완료.")
         return graphs
 
     def create_html_report(self, analysis_result: Dict[str, Any], sos_data: Dict[str, Any], graphs: Dict[str, str], output_dir: str, original_file: str) -> str:
@@ -1244,38 +1283,20 @@ class AIAnalyzer:
         
         system_info = sos_data.get('system_info', {})
         ip4_details = sos_data.get('ip4_details', [])
-        network_details = sos_data.get('network_details', {})
         storage_info = sos_data.get('storage', [])
-        process_stats = sos_data.get('process_stats', {})
-        failed_services = sos_data.get('failed_services', [])
         security_news = sos_data.get('security_news', [])
 
         status_colors = {"정상": "#28a745", "주의": "#ffc107", "위험": "#dc3545"}
         status_color = status_colors.get(status, "#6c757d")
 
-        ip4_details_rows = ""
-        if not ip4_details:
-            ip4_details_rows = "<tr><td colspan='6' style='text-align:center;'>데이터 없음</td></tr>"
-        else:
-            for item in ip4_details:
-                state_val = item.get('state', 'unknown').lower()
-                if 'up' in state_val:
-                    state_html = '<td style="color: green; font-weight: bold;">🔛 UP</td>'
-                elif 'down' in state_val:
-                    state_html = '<td style="color: grey;">📴 DOWN</td>'
-                else:
-                    state_html = f"<td>❓ {html.escape(state_val.upper())}</td>"
-                
-                ip4_details_rows += f"""
-                    <tr>
-                        <td>{html.escape(item.get('iface', 'N/A'))}</td>
-                        <td>{html.escape(item.get('master', 'N/A'))}</td>
-                        <td>{html.escape(item.get('mac', 'N/A'))}</td>
-                        <td>{html.escape(item.get('mtu', 'N/A'))}</td>
-                        {state_html}
-                        <td>{html.escape(item.get('ipv4', 'N/A'))}</td>
-                    </tr>
-                """
+        # --- Helper functions defined inside the method to avoid scope issues ---
+        def create_list_table(items: List[str], empty_message: str) -> str:
+            if not items:
+                return f"<tr><td style='text-align:center;'>{html.escape(empty_message)}</td></tr>"
+            rows = ""
+            for item in items:
+                rows += f"<tr><td>{html.escape(item)}</td></tr>"
+            return rows
 
         def create_table_rows(data_list, headers):
             rows = ""
@@ -1289,14 +1310,10 @@ class AIAnalyzer:
             for item in data_list:
                 rows += "<tr>"
                 for header in headers:
-                    if header == 'CVE' and isinstance(item.get(header), str):
-                        cve_id = html.escape(item.get(header))
-                        rows += f'<td><a href="https://access.redhat.com/security/cve/{cve_id}" target="_blank">{cve_id}</a></td>'
-                    else:
-                        rows += f"<td>{html.escape(str(item.get(header, 'N/A')))}</td>"
+                    rows += f"<td>{html.escape(str(item.get(header, 'N/A')))}</td>"
                 rows += "</tr>"
             return rows
-        
+
         def create_security_news_rows(news_list):
             rows = ""
             if not news_list:
@@ -1310,14 +1327,12 @@ class AIAnalyzer:
                 cve_id = html.escape(item.get('CVE', 'N/A'))
                 severity = item.get('severity', '').lower()
                 matched_package = html.escape(item.get('matched_package', 'N/A'))
-
-                severity_html = ''
+                
+                severity_html = f"<td>{html.escape(item.get('severity', 'N/A'))}</td>"
                 if severity == 'critical':
                     severity_html = f'<td style="text-align:center;"><div class="tooltip" style="font-size: 1.5em;">🔥<span class="tooltiptext">패키지: {matched_package}</span></div></td>'
                 elif severity == 'important':
                     severity_html = f'<td style="text-align:center;"><div class="tooltip" style="font-size: 1.5em;">⚠️<span class="tooltiptext">패키지: {matched_package}</span></div></td>'
-                else:
-                    severity_html = f"<td>{html.escape(item.get('severity', 'N/A'))}</td>"
 
                 rows += f"""
                     <tr>
@@ -1328,81 +1343,69 @@ class AIAnalyzer:
                     </tr>
                 """
             return rows
-        
+
         def create_recommendation_rows(recommendations_list):
             rows = ""
             if not recommendations_list:
                 return "<tr><td colspan='4' style='text-align:center;'>데이터 없음</td></tr>"
             
             for item in recommendations_list:
-                priority = html.escape(str(item.get('priority', 'N/A')))
-                category = html.escape(str(item.get('category', 'N/A')))
-                issue = html.escape(str(item.get('issue', 'N/A')))
-                solution = html.escape(str(item.get('solution', 'N/A')))
                 related_logs = item.get('related_logs', [])
-
-                issue_html = issue
+                issue_html = html.escape(str(item.get('issue', 'N/A')))
                 if related_logs:
                     logs_html = html.escape('\n'.join(related_logs))
-                    issue_html += f"""
-                        <div class="tooltip">
-                            <span class="log-icon">💬</span>
-                            <span class="tooltiptext">{logs_html}</span>
-                        </div>
-                    """
+                    issue_html += f' <div class="tooltip"><span class="log-icon">💬</span><span class="tooltiptext">{logs_html}</span></div>'
 
                 rows += f"""
                     <tr>
-                        <td>{priority}</td>
-                        <td>{category}</td>
+                        <td>{html.escape(str(item.get('priority', 'N/A')))}</td>
+                        <td>{html.escape(str(item.get('category', 'N/A')))}</td>
                         <td>{issue_html}</td>
-                        <td>{solution}</td>
+                        <td>{html.escape(str(item.get('solution', 'N/A')))}</td>
                     </tr>
                 """
             return rows
 
-        def create_list_table(items: List[str], empty_message: str) -> str:
-            if not items:
-                return f"<tr><td style='text-align:center;'>{html.escape(empty_message)}</td></tr>"
-            
-            rows = ""
-            for item in items:
-                rows += f"<tr><td>{html.escape(item)}</td></tr>"
-            return rows
-
-        graph_html = ""
-        if graphs:
-            graph_html += '<div class="section"><h2>📊 성능 분석 그래프</h2>'
-            graph_items = {
-                'cpu_graph': 'CPU 사용률', 'memory_graph': '메모리 사용률',
-                'network_graph': '네트워크 트래픽', 'disk_graph': '디스크 I/O'
-            }
-            for key, title in graph_items.items():
-                if key in graphs:
-                    graph_html += f'<div class="graph-container"><h3>{title}</h3><img src="data:image/png;base64,{graphs[key]}" alt="{title} Graph"></div>'
-            graph_html += '</div>'
+        ip4_details_rows = ""
+        if not ip4_details:
+            ip4_details_rows = "<tr><td colspan='6' style='text-align:center;'>데이터 없음</td></tr>"
+        else:
+            for item in ip4_details:
+                state_val = item.get('state', 'unknown').lower()
+                state_html = f'<td>{html.escape(state_val.upper())}</td>'
+                if 'up' in state_val:
+                    state_html = '<td style="color: green; font-weight: bold;">UP</td>'
+                elif 'down' in state_val:
+                    state_html = '<td style="color: grey;">DOWN</td>'
+                
+                ip4_details_rows += f"""
+                    <tr>
+                        <td>{html.escape(item.get('iface', 'N/A'))}</td>
+                        <td>{html.escape(item.get('master', 'N/A'))}</td>
+                        <td>{html.escape(item.get('mac', 'N/A'))}</td>
+                        <td>{html.escape(item.get('mtu', 'N/A'))}</td>
+                        {state_html}
+                        <td>{html.escape(item.get('ipv4', 'N/A'))}</td>
+                    </tr>
+                """
         
-        netdev_rx_rows = ""
-        netdev_tx_rows = ""
-        netdev_data = network_details.get('netdev', [])
-        for dev in netdev_data:
-            rx_packets = dev.get('rx_packets', 0)
-            rx_drop = dev.get('rx_drop', 0)
-            rx_multicast = dev.get('rx_multicast', 0)
-            rx_drop_pct = f"({int(rx_drop * 100 / rx_packets)}%)" if rx_packets > 0 else ""
-            rx_multicast_pct = f"({int(rx_multicast * 100 / rx_packets)}%)" if rx_packets > 0 else ""
-            netdev_rx_rows += f"<tr><td>{html.escape(dev['iface'])}</td><td>{dev['rx_bytes']:,}</td><td>{dev['rx_packets']:,}</td><td>{dev['rx_errs']}</td><td>{dev['rx_drop']} {rx_drop_pct}</td><td>{dev['rx_multicast']} {rx_multicast_pct}</td></tr>"
-            netdev_tx_rows += f"<tr><td>{html.escape(dev['iface'])}</td><td>{dev['tx_bytes']:,}</td><td>{dev['tx_packets']:,}</td><td>{dev['tx_errs']}</td><td>{dev['tx_drop']}</td><td>{dev['tx_colls']}</td><td>{dev['tx_carrier']}</td></tr>"
-
-        ethtool_rows = ""
-        ethtool_data = network_details.get('ethtool', {})
-        for iface, data in ethtool_data.items():
-            ethtool_rows += f"<tr><td>{html.escape(iface)}</td><td>{html.escape(data.get('link', 'N/A'))}</td><td>{html.escape(data.get('speed', 'N/A'))}</td><td>{html.escape(data.get('driver', 'N/A'))}</td><td>{html.escape(data.get('firmware', 'N/A'))}</td></tr>"
-
-        failed_services_rows = create_list_table(failed_services, "실패한 서비스가 없습니다.")
-        critical_issues_rows = create_list_table(critical_issues, "발견된 심각한 이슈가 없습니다.")
-        warnings_rows = create_list_table(warnings, "특별한 경고 사항이 없습니다.")
-
+        graph_html = ""
+        graph_html += '<div class="section"><h2>📊 성능 분석 요약</h2>'
+        graph_items = {
+            'cpu_graph': 'CPU 사용률', 'memory_graph': '메모리 사용률', 
+            'load_average_graph': 'System Load Average', 'network_graph': '네트워크 트래픽', 
+            'disk_graph': '디스크 I/O'
+        }
+        has_any_graph = False
+        for key, title in graph_items.items():
+            if key in graphs:
+                has_any_graph = True
+                graph_html += f'<div class="graph-container"><h3>{title}</h3><img src="data:image/png;base64,{graphs[key]}" alt="{title} Graph"></div>'
+        
+        if not has_any_graph:
+            graph_html += "<p style='text-align:center;'>분석할 수 있는 성능 데이터가 부족하여 그래프를 생성할 수 없습니다.</p>"
+        graph_html += '</div>'
+        
         html_template = f"""
 <!DOCTYPE html>
 <html lang="ko">
@@ -1418,58 +1421,18 @@ class AIAnalyzer:
         header h1 {{ margin: 0; font-size: 24px; }}
         .content {{ padding: 20px; }}
         .section {{ margin-bottom: 25px; }}
-        .section h2 {{ 
-            font-size: 20px;
-            border-left: 5px solid #007bff; 
-            padding-left: 10px; 
-            margin-bottom: 15px; 
-            color: #343a40; 
-        }}
-        .graph-container {{
-            margin-bottom: 20px;
-            padding: 15px;
-            border: 1px solid #e0e0e0;
-            border-radius: 5px;
-            background-color: #fafafa;
-        }}
+        .section h2 {{ font-size: 20px; border-left: 5px solid #007bff; padding-left: 10px; margin-bottom: 15px; color: #343a40; }}
+        .graph-container {{ margin-bottom: 20px; padding: 15px; border: 1px solid #e0e0e0; border-radius: 5px; background-color: #fafafa; }}
         .graph-container h3 {{ text-align: center; margin-top: 0; color: #333; }}
-        .graph-container img {{
-            width: 100%;
-            max-width: 900px;
-            display: block;
-            margin: auto;
-            border-radius: 4px;
-        }}
-        .data-table {{
-            width: 100%; border-collapse: collapse; margin-bottom: 20px;
-            table-layout: fixed; font-size: 14px; line-height: 1.6;
-        }}
-        .data-table th, .data-table td {{
-            border: 1px solid #dee2e6; padding: 12px; text-align: left;
-            word-wrap: break-word; vertical-align: top;
-        }}
-        .data-table thead th {{
-            background-color: #f8f9fa; color: #495057; font-weight: 600;
-            border-bottom: 2px solid #dee2e6;
-        }}
-        .data-table tbody th {{ background-color: #f8f9fa; font-weight: 600; width: 25%; }}
+        .graph-container img {{ width: 100%; max-width: 900px; display: block; margin: auto; border-radius: 4px; }}
+        .data-table {{ width: 100%; border-collapse: collapse; margin-bottom: 20px; font-size: 14px; }}
+        .data-table th, .data-table td {{ border: 1px solid #dee2e6; padding: 12px; text-align: left; word-wrap: break-word; }}
+        .data-table thead th {{ background-color: #f8f9fa; color: #495057; font-weight: 600; }}
         .data-table tbody tr:nth-child(even) {{ background-color: #f8f9fa; }}
-        .data-table tbody tr:hover {{ background-color: #e9ecef; }}
         .ai-status {{ font-size: 1.2em; font-weight: bold; color: {status_color}; }}
         footer {{ text-align: center; padding: 15px; font-size: 12px; color: #888; background-color: #f4f7f9; }}
-        
         .tooltip {{ position: relative; display: inline-block; cursor: pointer; }}
-        .tooltip .tooltiptext {{
-            visibility: hidden; width: 450px; max-height: 250px; overflow-y: auto; background-color: #333; color: #fff; text-align: left;
-            border-radius: 6px; padding: 10px; position: absolute; z-index: 1; bottom: 125%;
-            left: 50%; margin-left: -225px; opacity: 0; transition: opacity 0.3s; font-size: 12px;
-            white-space: pre-wrap; word-break: break-all; box-shadow: 0 2px 5px rgba(0,0,0,0.2);
-            font-family: 'Consolas', 'Monaco', monospace;
-        }}
-        .tooltip .tooltiptext::after {{
-            content: ""; position: absolute; top: 100%; left: 50%; margin-left: -5px;
-            border-width: 5px; border-style: solid; border-color: #333 transparent transparent transparent;
-        }}
+        .tooltip .tooltiptext {{ visibility: hidden; width: 450px; background-color: #333; color: #fff; text-align: left; border-radius: 6px; padding: 10px; position: absolute; z-index: 1; bottom: 125%; left: 50%; margin-left: -225px; opacity: 0; transition: opacity 0.3s; font-size: 12px; white-space: pre-wrap; }}
         .tooltip:hover .tooltiptext {{ visibility: visible; opacity: 1; }}
         .log-icon {{ font-size: 14px; margin-left: 5px; color: #007bff; }}
     </style>
@@ -1478,7 +1441,6 @@ class AIAnalyzer:
     <div class="container">
         <header><h1>S-Core System Report</h1></header>
         <div class="content">
-            
             <div class="section">
                 <h2>ℹ️ 시스템 요약</h2>
                 <table class="data-table">
@@ -1494,42 +1456,13 @@ class AIAnalyzer:
                     </tbody>
                 </table>
             </div>
-
             {graph_html}
-
             <div class="section">
                 <h2>🌐 네트워크 정보</h2>
                 <h3>IP4 상세 정보</h3>
                 <table class="data-table">
                     <thead><tr><th>Interface</th><th>Master IF</th><th>MAC Address</th><th>MTU</th><th>State</th><th>IPv4 Address</th></tr></thead>
                     <tbody>{ip4_details_rows}</tbody>
-                </table>
-                <h3>라우팅 테이블</h3>
-                <table class="data-table">
-                    <thead><tr><th>Destination</th><th>Gateway</th><th>Device</th><th>Source</th></tr></thead>
-                    <tbody>{create_table_rows(system_info.get('routing_table', []), ['destination', 'gateway', 'device', 'source'])}</tbody>
-                </table>
-                <h3>ETHTOOL 상태</h3>
-                <table class="data-table">
-                    <thead><tr><th>Interface</th><th>Link</th><th>Speed</th><th>Driver</th><th>Firmware</th></tr></thead>
-                    <tbody>{ethtool_rows}</tbody>
-                </table>
-                <h3>NETDEV 통계 (Receive)</h3>
-                <table class="data-table">
-                    <thead><tr><th>Interface</th><th>RxBytes</th><th>RxPackets</th><th>RxErrs</th><th>RxDrop</th><th>RxMulticast</th></tr></thead>
-                    <tbody>{netdev_rx_rows}</tbody>
-                </table>
-                <h3>NETDEV 통계 (Transmit)</h3>
-                <table class="data-table">
-                    <thead><tr><th>Interface</th><th>TxBytes</th><th>TxPackets</th><th>TxErrs</th><th>TxDrop</th><th>TxColls</th><th>TxCarrier</th></tr></thead>
-                    <tbody>{netdev_tx_rows}</tbody>
-                </table>
-                <h3>소켓 통계</h3>
-                <pre style="background:#eee; padding:10px; border-radius:4px; word-wrap:break-word;">{html.escape(chr(10).join(network_details.get('sockstat', [])))}</pre>
-                <h3>네트워크 본딩</h3>
-                <table class="data-table">
-                    <thead><tr><th>Device</th><th>Mode</th><th>Slaves</th></tr></thead>
-                    <tbody>{create_table_rows(network_details.get('bonding', []), ['device', 'mode', 'slaves'])}</tbody>
                 </table>
             </div>
             <div class="section">
@@ -1540,79 +1473,29 @@ class AIAnalyzer:
                 </table>
             </div>
             <div class="section">
-                <h2>⚙️ 리소스 사용 현황</h2>
-                <h3>프로세스 요약</h3>
-                <table class="data-table">
-                    <tbody><tr><th>Total Processes</th><td>{process_stats.get('total', 'N/A')}</td></tr></tbody>
-                </table>
-                <h3>Top Users of CPU & MEM</h3>
-                <table class="data-table">
-                    <thead><tr><th>USER</th><th>%CPU</th><th>%MEM</th><th>RSS</th></tr></thead>
-                    <tbody>{create_table_rows(process_stats.get('by_user', []), ['user', 'cpu%', 'mem%', 'rss'])}</tbody>
-                </table>
-                <h3>Uninterruptible Sleep Processes ({len(process_stats.get('uninterruptible', []))})</h3>
-                <table class="data-table">
-                    <thead><tr><th>USER</th><th>PID</th><th>%CPU</th><th>%MEM</th><th>RSS</th><th>STAT</th><th>START</th><th>TIME</th><th>COMMAND</th></tr></thead>
-                    <tbody>{create_table_rows(process_stats.get('uninterruptible', []), ['user', 'pid', 'cpu%', 'mem%', 'rss', 'stat', 'start', 'time', 'command'])}</tbody>
-                </table>
-                <h3>Zombie Processes ({len(process_stats.get('zombie', []))})</h3>
-                <table class="data-table">
-                    <thead><tr><th>USER</th><th>PID</th><th>%CPU</th><th>%MEM</th><th>RSS</th><th>STAT</th><th>START</th><th>TIME</th><th>COMMAND</th></tr></thead>
-                    <tbody>{create_table_rows(process_stats.get('zombie', []), ['user', 'pid', 'cpu%', 'mem%', 'rss', 'stat', 'start', 'time', 'command'])}</tbody>
-                </table>
-                <h3>Top 5 Processes (CPU)</h3>
-                <table class="data-table">
-                    <colgroup><col style="width:10%"><col style="width:15%"><col style="width:15%"><col style="width:60%"></colgroup>
-                    <thead><tr><th>PID</th><th>User</th><th>CPU %</th><th>Command</th></tr></thead>
-                    <tbody>{create_table_rows(process_stats.get('top_cpu', []), ['pid', 'user', 'cpu%', 'command'])}</tbody>
-                </table>
-                <h3>Top 5 Processes (Memory)</h3>
-                <table class="data-table">
-                    <colgroup><col style="width:10%"><col style="width:15%"><col style="width:15%"><col style="width:60%"></colgroup>
-                    <thead><tr><th>PID</th><th>User</th><th>RSS (KiB)</th><th>Command</th></tr></thead>
-                    <tbody>{create_table_rows(process_stats.get('top_mem', []), ['pid', 'user', 'rss', 'command'])}</tbody>
-                </table>
-            </div>
-            <div class="section">
-                <h2>🔧 실패한 서비스 ({len(failed_services)}개)</h2>
-                <table class="data-table">
-                    <colgroup><col style="width:100%"></colgroup>
-                    <thead><tr><th>상세 내용</th></tr></thead>
-                    <tbody>{failed_services_rows}</tbody>
-                </table>
-            </div>
-
-            <div class="section">
                 <h2>🚨 AI 분석: 심각한 이슈 ({len(critical_issues)}개)</h2>
                 <table class="data-table">
-                    <colgroup><col style="width:100%"></colgroup>
                     <thead><tr><th>상세 내용</th></tr></thead>
-                    <tbody>{critical_issues_rows}</tbody>
+                    <tbody>{create_list_table(critical_issues, "발견된 심각한 이슈가 없습니다.")}</tbody>
                 </table>
             </div>
-
             <div class="section">
                 <h2>⚠️ AI 분석: 경고 사항 ({len(warnings)}개)</h2>
                 <table class="data-table">
-                    <colgroup><col style="width:100%"></colgroup>
                     <thead><tr><th>상세 내용</th></tr></thead>
-                    <tbody>{warnings_rows}</tbody>
+                    <tbody>{create_list_table(warnings, "특별한 경고 사항이 없습니다.")}</tbody>
                 </table>
             </div>
-
             <div class="section">
                 <h2>💡 AI 분석: 권장사항 ({len(recommendations)}개)</h2>
                 <table class="data-table">
-                    <colgroup><col style="width:10%"><col style="width:15%"><col style="width:35%"><col style="width:40%"></colgroup>
                     <thead><tr><th>우선순위</th><th>카테고리</th><th>문제점 💬</th><th>해결 방안</th></tr></thead>
                     <tbody>{create_recommendation_rows(recommendations)}</tbody>
                 </table>
             </div>
-            
             <div class="section">
                 <h2>🤖 AI 종합 분석</h2>
                 <table class="data-table">
-                    <colgroup><col style="width:20%"><col style="width:80%"></colgroup>
                     <tbody>
                         <tr><th>종합 상태</th><td><span class="ai-status">{status}</span></td></tr>
                         <tr><th>건강도 점수</th><td>{score}/100</td></tr>
@@ -1620,17 +1503,13 @@ class AIAnalyzer:
                     </tbody>
                 </table>
             </div>
-
             <div class="section">
                 <h2>🛡️ 보안 뉴스 (가장 중요한 CVE 최대 10개) <span style="font-size: 0.7em; font-weight: normal;">(🔥 Critical, ⚠️ Important)</span></h2>
                 <table class="data-table">
-                    <colgroup><col style="width:18%"><col style="width:10%"><col style="width:12%"><col style="width:60%"></colgroup>
                     <thead><tr><th>CVE 식별자</th><th>심각도</th><th>생성일</th><th>위협 및 영향 요약</th></tr></thead>
                     <tbody>{create_security_news_rows(security_news)}</tbody>
                 </table>
-                <p style="font-size: 12px; text-align: center;">보안 정보에 대한 상세 내용은 <a href="https://access.redhat.com/security/security-updates/security-advisories" target="_blank">Red Hat Security Advisories</a> 사이트에서 확인하실 수 있습니다.</p>
             </div>
-
         </div>
         <footer>보고서 생성 시각: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</footer>
     </div>
@@ -1689,10 +1568,6 @@ def main():
         print("경고: 'matplotlib' 라이브러리를 찾을 수 없어 그래프 생성 기능이 비활성화됩니다.", file=sys.stderr)
         print("'pip install matplotlib' 명령어로 설치해주세요.", file=sys.stderr)
     
-    if not BeautifulSoup:
-        print("경고: 'beautifulsoup4'와 'lxml' 라이브러리를 찾을 수 없어 XML 파싱 기능이 비활성화됩니다.", file=sys.stderr)
-        print("'pip install beautifulsoup4 lxml' 명령어로 설치해주세요.", file=sys.stderr)
-
     analyzer = AIAnalyzer(
         llm_url=args.llm_url, model_name=args.model,
         endpoint_path=args.endpoint_path, api_token=api_token,
@@ -1763,6 +1638,8 @@ def main():
 
     except Exception as e:
         print(f"\n❌ 전체 분석 과정 중 오류 발생: {e}")
+        import traceback
+        traceback.print_exc()
         sys.exit(1)
     finally:
         if os.path.exists(temp_extract_dir):
@@ -1775,3 +1652,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
