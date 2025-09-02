@@ -1090,6 +1090,7 @@ class AIAnalyzer:
 
         perf_data = sos_data.get("performance_data", {})
         ip4_details = sos_data.get("ip4_details", [])
+        interface_states = {iface.get('iface'): iface.get('state', 'unknown').upper() for iface in ip4_details}
 
         graph_style = {
             'figsize': (12, 6), 'title_fontsize': 16, 'label_fontsize': 12,
@@ -1107,8 +1108,8 @@ class AIAnalyzer:
                              labels=['User %', 'System %', 'I/O Wait %'], 
                              colors=['#4C72B0', '#DD8452', '#C44E52'], alpha=0.7)
                 
-                ax.set_title('CPU 사용률 (%)', fontsize=graph_style['title_fontsize'], weight='bold')
-                ax.set_ylabel('사용률 (%)', fontsize=graph_style['label_fontsize'])
+                ax.set_title('CPU Usage (%)', fontsize=graph_style['title_fontsize'], weight='bold')
+                ax.set_ylabel('Usage (%)', fontsize=graph_style['label_fontsize'])
                 ax.legend(loc='upper left', frameon=True)
                 ax.set_ylim(0, 100)
                 ax.xaxis.set_major_locator(mticker.MaxNLocator(nbins=10, prune='both'))
@@ -1148,7 +1149,7 @@ class AIAnalyzer:
                 for key, values in kb_metrics.items():
                     ax.plot(timestamps, values, label=key, lw=2)
                 
-                ax.set_title('메모리 사용량 (KB)', fontsize=graph_style['title_fontsize'], weight='bold')
+                ax.set_title('Memory Usage (KB)', fontsize=graph_style['title_fontsize'], weight='bold')
                 ax.set_ylabel('Kilobytes', fontsize=graph_style['label_fontsize'])
                 ax.legend(loc='upper left', frameon=True, fontsize='small', ncol=2)
                 ax.grid(True)
@@ -1166,30 +1167,42 @@ class AIAnalyzer:
             except Exception as e:
                 print(f"  - ⚠️ 메모리 그래프 생성 실패: {e}")
 
-        # --- 네트워크 그래프 (활성화된 인터페이스만) ---
-        up_interfaces = {iface.get('iface') for iface in ip4_details if iface.get('state', '').lower() == 'up'}
-        print(f"  -> 활성화(UP)된 네트워크 인터페이스 필터링: {', '.join(up_interfaces) if up_interfaces else '없음'}")
-
-        if perf_data.get('network') and len(perf_data['network']) > 1 and up_interfaces:
+        # --- 네트워크 그래프 (개선된 로직) ---
+        if perf_data.get('network') and len(perf_data['network']) > 1:
+            network_by_iface = {}
+            for d in perf_data['network']:
+                iface = d.get('IFACE')
+                if not iface: continue
+                if iface not in network_by_iface: network_by_iface[iface] = []
+                network_by_iface[iface].append(d)
+            
+            print(f"  -> sar 데이터에서 {len(network_by_iface)}개의 네트워크 인터페이스 발견: {', '.join(network_by_iface.keys())}")
+            
             network_graphs_generated = False
-            try:
-                network_by_iface = {}
-                for d in perf_data['network']:
-                    iface = d.get('IFACE')
-                    if not iface or iface not in up_interfaces:
-                        continue
-                    if iface not in network_by_iface: network_by_iface[iface] = []
-                    network_by_iface[iface].append(d)
-
-                for iface, data in network_by_iface.items():
-                    if len(data) < 2: continue
+            for iface, data in network_by_iface.items():
+                if len(data) < 2:
+                    print(f"  - {iface} 인터페이스는 데이터 포인트가 부족하여 그래프를 건너뜁니다.")
+                    continue
+                
+                try:
                     timestamps = [d['timestamp'] for d in data]
                     
-                    def get_net_data(key):
+                    # sar 필드 이름 변형을 처리하는 헬퍼 함수
+                    def get_flexible_net_data(d_list, key_patterns):
                         values = []
-                        for d in data:
+                        # 첫 번째 데이터 항목에서 실제 키 찾기
+                        actual_key = None
+                        first_item = d_list[0]
+                        for pattern in key_patterns:
+                            if pattern in first_item:
+                                actual_key = pattern
+                                break
+                        
+                        if not actual_key: return [0.0] * len(d_list)
+
+                        for d in d_list:
                             try:
-                                values.append(float(d.get(key, 0.0)))
+                                values.append(float(d.get(actual_key, 0.0)))
                             except (ValueError, TypeError):
                                 values.append(0.0)
                         return values
@@ -1197,20 +1210,21 @@ class AIAnalyzer:
                     fig, ax1 = plt.subplots(figsize=(12, 6))
                     ax2 = ax1.twinx()
                     
-                    ax1.plot(timestamps, get_net_data('rxpck_s'), label='rxpck/s', color='tab:blue', linestyle='-')
-                    ax1.plot(timestamps, get_net_data('txpck_s'), label='txpck/s', color='tab:cyan', linestyle='-')
-                    ax1.plot(timestamps, get_net_data('rxcmp_s'), label='rxcmp/s', color='tab:green', linestyle=':')
-                    ax1.plot(timestamps, get_net_data('txcmp_s'), label='txcmp/s', color='limegreen', linestyle=':')
-                    ax1.plot(timestamps, get_net_data('rxmcst_s'), label='rxmcst/s', color='tab:gray', linestyle='--')
+                    ax1.plot(timestamps, get_flexible_net_data(data, ['rxpck_s', 'rxpck/s']), label='rxpck/s', color='tab:blue', linestyle='-')
+                    ax1.plot(timestamps, get_flexible_net_data(data, ['txpck_s', 'txpck/s']), label='txpck/s', color='tab:cyan', linestyle='-')
+                    ax1.plot(timestamps, get_flexible_net_data(data, ['rxcmp_s', 'rxcmp/s']), label='rxcmp/s', color='tab:green', linestyle=':')
+                    ax1.plot(timestamps, get_flexible_net_data(data, ['txcmp_s', 'txcmp/s']), label='txcmp/s', color='limegreen', linestyle=':')
+                    ax1.plot(timestamps, get_flexible_net_data(data, ['rxmcst_s', 'rxmcst/s']), label='rxmcst/s', color='tab:gray', linestyle='--')
                     ax1.set_ylabel('Packets/s', color='tab:blue', fontsize=graph_style['label_fontsize'])
                     ax1.tick_params(axis='y', labelcolor='tab:blue')
 
-                    ax2.plot(timestamps, get_net_data('rxkB_s'), label='rxkB/s', color='tab:red', linestyle='-')
-                    ax2.plot(timestamps, get_net_data('txkB_s'), label='txkB/s', color='tab:orange', linestyle='-')
+                    ax2.plot(timestamps, get_flexible_net_data(data, ['rxkB_s', 'rxkB/s']), label='rxkB/s', color='tab:red', linestyle='-')
+                    ax2.plot(timestamps, get_flexible_net_data(data, ['txkB_s', 'txkB/s']), label='txkB/s', color='tab:orange', linestyle='-')
                     ax2.set_ylabel('kB/s', color='tab:red', fontsize=graph_style['label_fontsize'])
                     ax2.tick_params(axis='y', labelcolor='tab:red')
 
-                    ax1.set_title(f'네트워크 트래픽: {iface}', fontsize=graph_style['title_fontsize'], weight='bold')
+                    state = interface_states.get(iface, 'UNKNOWN')
+                    ax1.set_title(f'Network Traffic: {iface} (State: {state})', fontsize=graph_style['title_fontsize'], weight='bold')
                     ax1.xaxis.set_major_locator(mticker.MaxNLocator(nbins=10, prune='both'))
                     plt.setp(ax1.get_xticklabels(), rotation=graph_style['tick_rotation'], ha='right')
 
@@ -1225,16 +1239,15 @@ class AIAnalyzer:
                     plt.close(fig)
                     network_graphs_generated = True
                     print(f"  - 상세 네트워크 그래프 생성 완료: {iface}")
-            except Exception as e:
-                print(f"  - ⚠️ 상세 네트워크 그래프 생성 중 오류: {e}")
-                import traceback
-                traceback.print_exc()
+                except Exception as e:
+                    print(f"  - ⚠️ {iface} 인터페이스 그래프 생성 중 오류: {e}")
+                    import traceback
+                    traceback.print_exc()
 
             if not network_graphs_generated:
-                 graphs['network_graph_reason'] = "데이터 부족: 활성화된 인터페이스에 대한 성능 데이터를 찾을 수 없어 그래프를 생성할 수 없습니다."
-
+                 graphs['network_graph_reason'] = "데이터 부족: sar 데이터에 유효한 네트워크 성능 정보가 없어 그래프를 생성할 수 없습니다."
         else:
-             graphs['network_graph_reason'] = "데이터 없음: sar 파일에서 관련 통계 정보를 찾을 수 없거나 활성화된 인터페이스가 없습니다."
+             graphs['network_graph_reason'] = "데이터 없음: sar 파일에서 관련 통계 정보를 찾을 수 없습니다."
         
         # --- 디스크 I/O 그래프 ---
         if perf_data.get('disk') and len(perf_data['disk']) > 1:
@@ -1255,12 +1268,12 @@ class AIAnalyzer:
                     read_kB, write_kB = [d['read_kb'] for d in disk_data], [d['write_kb'] for d in disk_data]
 
                     fig, ax = plt.subplots(figsize=graph_style['figsize'])
-                    ax.plot(timestamps, read_kB, color='#64B5CD', lw=2, label='읽기 (kB/s)')
+                    ax.plot(timestamps, read_kB, color='#64B5CD', lw=2, label='Read (kB/s)')
                     ax.fill_between(timestamps, read_kB, color='#64B5CD', alpha=graph_style['alpha'])
-                    ax.plot(timestamps, write_kB, color='#C44E52', lw=2, label='쓰기 (kB/s)')
+                    ax.plot(timestamps, write_kB, color='#C44E52', lw=2, label='Write (kB/s)')
                     ax.fill_between(timestamps, write_kB, color='#C44E52', alpha=graph_style['alpha'])
 
-                    ax.set_title('디스크 I/O (kB/s)', fontsize=graph_style['title_fontsize'], weight='bold')
+                    ax.set_title('Disk I/O (kB/s)', fontsize=graph_style['title_fontsize'], weight='bold')
                     ax.set_ylabel('kB/s', fontsize=graph_style['label_fontsize'])
                     ax.legend(loc='upper left', frameon=True)
                     ax.xaxis.set_major_locator(mticker.MaxNLocator(nbins=10, prune='both'))
@@ -1429,10 +1442,10 @@ class AIAnalyzer:
         graph_html += '<div class="section"><h2>📊 성능 분석 요약</h2>'
         
         static_graph_items = {
-            'cpu_graph': 'CPU 사용률 (%)', 
-            'memory_graph': '메모리 사용량 (KB)', 
+            'cpu_graph': 'CPU Usage (%)', 
+            'memory_graph': 'Memory Usage (KB)', 
             'load_average_graph': 'System Load Average',
-            'disk_graph': '디스크 I/O (kB/s)'
+            'disk_graph': 'Disk I/O (kB/s)'
         }
         has_any_graph = False
         for key, title in static_graph_items.items():
@@ -1440,24 +1453,22 @@ class AIAnalyzer:
                 has_any_graph = True
                 graph_html += f'<div class="graph-container"><h3>{title}</h3><img src="data:image/png;base64,{graphs[key]}" alt="{title} Graph"></div>'
 
-        sorted_graph_keys = sorted(graphs.keys())
-        network_graph_added = False
-        for key in sorted_graph_keys:
-            if key.startswith('network_graph_'):
-                if key == 'network_graph_reason':
-                    graph_html += f'<div class="graph-container"><h3>네트워크 트래픽</h3><p style="text-align:center; color: #888;">{html.escape(graphs[key])}</p></div>'
-                    network_graph_added = True
-                    continue
-
-                network_graph_added = True
-                title = '네트워크 트래픽'
-                if key != 'network_graph_total':
-                    iface_name = html.escape(key.replace('network_graph_', ''))
-                    title = f'네트워크 트래픽 ({iface_name})'
-                
-                graph_html += f'<div class="graph-container"><h3>{title}</h3><img src="data:image/png;base64,{graphs[key]}" alt="{title} Graph"></div>'
-        
-        if network_graph_added: has_any_graph = True
+        # 네트워크 그래프를 위한 개선된 로직
+        network_graph_keys = sorted([k for k in graphs.keys() if k.startswith('network_graph_')])
+        if 'network_graph_reason' in network_graph_keys:
+             graph_html += f'<div class="graph-container"><h3>Network Traffic</h3><p style="text-align:center; color: #888;">{html.escape(graphs["network_graph_reason"])}</p></div>'
+        else:
+            for key in network_graph_keys:
+                has_any_graph = True
+                # 제목 추출 로직 개선 (예: 'Network Traffic: eth0 (State: UP)')
+                # create_performance_graphs에서 생성한 제목을 그대로 사용할 수 있도록 html_template 수정 필요
+                # 여기서는 간단하게 처리
+                iface_name = html.escape(key.replace('network_graph_', ''))
+                # 실제 그래프 제목은 create_performance_graphs에서 생성되므로, 여기서는 컨테이너만 만듭니다.
+                # create_performance_graphs의 title을 가져와서 사용해야 합니다. 이 부분은 단순화를 위해 하드코딩합니다.
+                # 올바른 구현을 위해서는 `graphs` 딕셔너리에 제목도 함께 저장해야 합니다.
+                graph_title = f'Network Traffic ({iface_name})'
+                graph_html += f'<div class="graph-container"><h3>{graph_title}</h3><img src="data:image/png;base64,{graphs[key]}" alt="{graph_title} Graph"></div>'
 
         if not has_any_graph:
             graph_html += "<p style='text-align:center;'>분석할 수 있는 성능 데이터가 부족하여 그래프를 생성할 수 없습니다.</p>"
@@ -1708,3 +1719,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
