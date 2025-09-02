@@ -482,7 +482,10 @@ class SosreportParser:
             parts = re.split(r'\s+', line.strip())
 
             # --- 헤더 라인 식별 및 분석 ---
-            is_header = any(p.isalpha() and p not in ["AM", "PM", "all"] for p in parts[1:])
+            # FIX: A data line with an interface name (e.g., 'eth0') was incorrectly identified as a header.
+            # The check is now more specific, looking for known section keywords.
+            header_keywords = {'CPU', 'IFACE', 'kbmemfree', 'DEV', 'runq-sz'}
+            is_header = any(keyword in parts for keyword in header_keywords)
             
             if is_header:
                 header_map = {}
@@ -641,28 +644,49 @@ class AIAnalyzer:
             print(f"사용 모델: {self.model_name}")
 
     def _setup_korean_font(self):
-        """matplotlib에서 한글을 지원하기 위한 폰트 설정"""
+        """matplotlib에서 한글을 지원하기 위해 'Malgun Gothic'을 우선적으로 설정하고, 없을 경우 대체 폰트를 찾습니다."""
         if not plt:
             return
+
+        # 우선적으로 'Malgun Gothic'을 시도
+        font_name = 'Malgun Gothic'
         
-        font_paths = fm.findSystemFonts(fontpaths=None, fontext='ttf')
-        korean_font_path = None
-        for path in font_paths:
-            if 'nanum' in path.lower() or 'malgun' in path.lower():
-                korean_font_path = path
-                break
-        
-        if korean_font_path:
-            try:
-                fm.fontManager.addfont(korean_font_path)
-                font_name = fm.FontProperties(fname=korean_font_path).get_name()
-                plt.rc('font', family=font_name)
-                plt.rc('axes', unicode_minus=False)
-                print(f"✅ 한글 폰트 설정 완료: {font_name}")
-            except Exception as e:
-                print(f"⚠️ 한글 폰트 설정 중 오류 발생: {e}. 그래프 제목이 깨질 수 있습니다.")
-        else:
-            print("⚠️ 경고: '나눔고딕' 또는 '맑은 고딕' 폰트를 찾을 수 없습니다. 그래프의 한글이 깨질 수 있습니다.")
+        try:
+            # findfont: 폰트가 없으면 ValueError 발생
+            fm.findfont(font_name, fallback_to_default=False)
+            plt.rc('font', family=font_name)
+            print(f"✅ Matplotlib 그래프 폰트를 '{font_name}'으로 설정했습니다.")
+        except ValueError:
+            print(f"⚠️ '{font_name}' 폰트를 찾을 수 없습니다. 시스템에 맞는 다른 한글 폰트를 검색합니다.")
+            
+            # OS에 따라 대체 폰트 목록 정의
+            if sys.platform == "win32":
+                font_candidates = ["Malgun Gothic", "NanumGothic", "Dotum"]
+            elif sys.platform == "darwin":
+                font_candidates = ["AppleGothic", "NanumGothic"]
+            else: # Linux, etc.
+                font_candidates = ["NanumGothic", "UnDotum"]
+            
+            found_font = None
+            for candidate in font_candidates:
+                try:
+                    fm.findfont(candidate, fallback_to_default=False)
+                    found_font = candidate
+                    break # 첫 번째로 찾은 폰트 사용
+                except ValueError:
+                    continue
+
+            if found_font:
+                plt.rc('font', family=found_font)
+                print(f"✅ 대체 폰트 '{found_font}'으로 설정했습니다.")
+            else:
+                print("❌ 시스템에서 사용할 수 있는 한글 폰트를 찾지 못했습니다.")
+                print("  -> 그래프의 한글이 깨질 수 있습니다. '맑은 고딕'이나 '나눔고딕'을 설치해주세요.")
+                if sys.platform.startswith("linux"):
+                    print("  -> (예: sudo apt-get install fonts-nanum*)")
+
+        # 마이너스 기호가 깨지는 것을 방지
+        plt.rc('axes', unicode_minus=False)
 
 
     def list_available_models(self):
@@ -1054,7 +1078,7 @@ class AIAnalyzer:
             traceback.print_exc()
             return [{"reason": f"보안 뉴스 조회 중 오류가 발생했습니다: {e}"}]
 
-    def create_performance_graphs(self, perf_data: Dict[str, List[Dict[str, Any]]]) -> Dict[str, str]:
+    def create_performance_graphs(self, sos_data: Dict[str, Any]) -> Dict[str, str]:
         """성능 데이터를 바탕으로 CPU, Memory, Network, Disk I/O, Load Average 그래프를 생성합니다."""
         if not plt:
             print("⚠️ 그래프 생성을 건너뜁니다. 'matplotlib' 라이브러리를 설치하세요.")
@@ -1063,6 +1087,9 @@ class AIAnalyzer:
         print("성능 그래프 생성 중...")
         graphs = {}
         plt.style.use('seaborn-v0_8-whitegrid')
+
+        perf_data = sos_data.get("performance_data", {})
+        ip4_details = sos_data.get("ip4_details", [])
 
         graph_style = {
             'figsize': (12, 6), 'title_fontsize': 16, 'label_fontsize': 12,
@@ -1139,14 +1166,18 @@ class AIAnalyzer:
             except Exception as e:
                 print(f"  - ⚠️ 메모리 그래프 생성 실패: {e}")
 
-        # --- 네트워크 그래프 (인터페이스별 상세 + 전체 통합 Fallback) ---
-        if perf_data.get('network') and len(perf_data['network']) > 1:
+        # --- 네트워크 그래프 (활성화된 인터페이스만) ---
+        up_interfaces = {iface.get('iface') for iface in ip4_details if iface.get('state', '').lower() == 'up'}
+        print(f"  -> 활성화(UP)된 네트워크 인터페이스 필터링: {', '.join(up_interfaces) if up_interfaces else '없음'}")
+
+        if perf_data.get('network') and len(perf_data['network']) > 1 and up_interfaces:
             network_graphs_generated = False
             try:
                 network_by_iface = {}
                 for d in perf_data['network']:
                     iface = d.get('IFACE')
-                    if not iface or iface == 'lo': continue
+                    if not iface or iface not in up_interfaces:
+                        continue
                     if iface not in network_by_iface: network_by_iface[iface] = []
                     network_by_iface[iface].append(d)
 
@@ -1169,7 +1200,7 @@ class AIAnalyzer:
                     ax1.plot(timestamps, get_net_data('rxpck_s'), label='rxpck/s', color='tab:blue', linestyle='-')
                     ax1.plot(timestamps, get_net_data('txpck_s'), label='txpck/s', color='tab:cyan', linestyle='-')
                     ax1.plot(timestamps, get_net_data('rxcmp_s'), label='rxcmp/s', color='tab:green', linestyle=':')
-                    ax1.plot(timestamps, get_net_data('txcmp_s'), label='txcmp/s', color='tab:lime', linestyle=':')
+                    ax1.plot(timestamps, get_net_data('txcmp_s'), label='txcmp/s', color='limegreen', linestyle=':')
                     ax1.plot(timestamps, get_net_data('rxmcst_s'), label='rxmcst/s', color='tab:gray', linestyle='--')
                     ax1.set_ylabel('Packets/s', color='tab:blue', fontsize=graph_style['label_fontsize'])
                     ax1.tick_params(axis='y', labelcolor='tab:blue')
@@ -1199,46 +1230,11 @@ class AIAnalyzer:
                 import traceback
                 traceback.print_exc()
 
-            if not network_graphs_generated and perf_data.get('network'):
-                print("  -> 상세 네트워크 그래프 생성 실패. 전체 통합 그래프로 대체합니다.")
-                try:
-                    net_agg = {}
-                    for d in perf_data['network']:
-                        ts = d['timestamp']
-                        if ts not in net_agg: net_agg[ts] = {'rx_kb': 0.0, 'tx_kb': 0.0}
-                        try:
-                            net_agg[ts]['rx_kb'] += float(d.get('rxkB_s', 0.0))
-                            net_agg[ts]['tx_kb'] += float(d.get('txkB_s', 0.0))
-                        except (ValueError, TypeError):
-                            pass
-                    
-                    net_data = sorted([{'timestamp': ts, **data} for ts, data in net_agg.items()], key=lambda x: x['timestamp'])
-                    if len(net_data) > 1:
-                        timestamps = [d['timestamp'] for d in net_data]
-                        rxkB, txkB = [d['rx_kb'] for d in net_data], [d['tx_kb'] for d in net_data]
+            if not network_graphs_generated:
+                 graphs['network_graph_reason'] = "데이터 부족: 활성화된 인터페이스에 대한 성능 데이터를 찾을 수 없어 그래프를 생성할 수 없습니다."
 
-                        fig, ax = plt.subplots(figsize=graph_style['figsize'])
-                        ax.plot(timestamps, rxkB, color='#8172B3', lw=2, label='전체 수신 (kB/s)')
-                        ax.fill_between(timestamps, rxkB, color='#8172B3', alpha=graph_style['alpha'])
-                        ax.plot(timestamps, txkB, color='#CCB974', lw=2, label='전체 송신 (kB/s)')
-                        ax.fill_between(timestamps, txkB, color='#CCB974', alpha=graph_style['alpha'])
-
-                        ax.set_title('전체 네트워크 트래픽 (kB/s)', fontsize=graph_style['title_fontsize'], weight='bold')
-                        ax.set_ylabel('kB/s', fontsize=graph_style['label_fontsize'])
-                        ax.legend(loc='upper left', frameon=True)
-                        ax.xaxis.set_major_locator(mticker.MaxNLocator(nbins=10, prune='both'))
-                        plt.xticks(rotation=graph_style['tick_rotation'], ha='right')
-                        plt.tight_layout()
-
-                        buf = io.BytesIO()
-                        fig.savefig(buf, format='png', dpi=100)
-                        graphs['network_graph_total'] = base64.b64encode(buf.getvalue()).decode('utf-8')
-                        plt.close(fig)
-                        print("  - 전체 통합 네트워크 그래프 생성 완료.")
-                except Exception as e_fallback:
-                    print(f"  - ⚠️ 전체 통합 네트워크 그래프 생성조차 실패: {e_fallback}")
         else:
-             graphs['network_graph_reason'] = "데이터 없음: sar 파일에서 관련 통계 정보를 찾을 수 없습니다."
+             graphs['network_graph_reason'] = "데이터 없음: sar 파일에서 관련 통계 정보를 찾을 수 없거나 활성화된 인터페이스가 없습니다."
         
         # --- 디스크 I/O 그래프 ---
         if perf_data.get('disk') and len(perf_data['disk']) > 1:
@@ -1433,10 +1429,10 @@ class AIAnalyzer:
         graph_html += '<div class="section"><h2>📊 성능 분석 요약</h2>'
         
         static_graph_items = {
-            'cpu_graph': 'CPU 사용률', 
+            'cpu_graph': 'CPU 사용률 (%)', 
             'memory_graph': '메모리 사용량 (KB)', 
             'load_average_graph': 'System Load Average',
-            'disk_graph': '디스크 I/O'
+            'disk_graph': '디스크 I/O (kB/s)'
         }
         has_any_graph = False
         for key, title in static_graph_items.items():
@@ -1475,8 +1471,7 @@ class AIAnalyzer:
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>AI 분석 보고서</title>
     <style>
-        @import url('https://cdn.jsdelivr.net/gh/projectnoonnu/noonfonts_six@1.2/S-CoreDream.css');
-        body {{ font-family: 'S-CoreDream', 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background-color: #f4f7f9; color: #333; margin: 0; padding: 20px; }}
+        body {{ font-family: 'Malgun Gothic', '맑은 고딕', sans-serif; background-color: #f4f7f9; color: #333; margin: 0; padding: 20px; }}
         .container {{ max-width: 1200px; margin: auto; background: #fff; border-radius: 8px; box-shadow: 0 4px 8px rgba(0,0,0,0.1); overflow: hidden; }}
         header {{ background-color: #343a40; color: white; padding: 20px; text-align: center; }}
         header h1 {{ margin: 0; font-size: 24px; }}
@@ -1682,7 +1677,7 @@ def main():
         
         sos_data['ai_analysis'] = result
         sos_data['security_news'] = analyzer.fetch_security_news(sos_data)
-        graphs = analyzer.create_performance_graphs(sos_data.get("performance_data", {}))
+        graphs = analyzer.create_performance_graphs(sos_data)
         
         results = {}
         if not args.no_html:
@@ -1713,4 +1708,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
