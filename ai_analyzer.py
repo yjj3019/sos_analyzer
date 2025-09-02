@@ -482,8 +482,6 @@ class SosreportParser:
             parts = re.split(r'\s+', line.strip())
 
             # --- 헤더 라인 식별 및 분석 ---
-            # FIX: A data line with an interface name (e.g., 'eth0') was incorrectly identified as a header.
-            # The check is now more specific, looking for known section keywords.
             header_keywords = {'CPU', 'IFACE', 'kbmemfree', 'DEV', 'runq-sz'}
             is_header = any(keyword in parts for keyword in header_keywords)
             
@@ -519,10 +517,10 @@ class SosreportParser:
                 if current_section == 'cpu' and entry.get('CPU') == 'all':
                     performance_data['cpu'].append({
                         'timestamp': timestamp,
-                        'user': float(entry.get('pct_user', 0)),
-                        'system': float(entry.get('pct_sys', 0)),
-                        'iowait': float(entry.get('pct_iowait', 0)),
-                        'idle': float(entry.get('pct_idle', 0))
+                        'user': float(entry.get('pct_user', '0').replace(',', '.')),
+                        'system': float(entry.get('pct_sys', '0').replace(',', '.')),
+                        'iowait': float(entry.get('pct_iowait', '0').replace(',', '.')),
+                        'idle': float(entry.get('pct_idle', '0').replace(',', '.'))
                     })
                 elif current_section == 'mem':
                     performance_data['memory'].append(entry)
@@ -533,11 +531,12 @@ class SosreportParser:
                 elif current_section == 'load':
                     performance_data['load'].append({
                         'timestamp': timestamp,
-                        'ldavg-1': float(entry.get('ldavg-1', 0)),
-                        'ldavg-5': float(entry.get('ldavg-5', 0)),
-                        'ldavg-15': float(entry.get('ldavg-15', 0))
+                        'ldavg-1': float(entry.get('ldavg-1', '0').replace(',', '.')),
+                        'ldavg-5': float(entry.get('ldavg-5', '0').replace(',', '.')),
+                        'ldavg-15': float(entry.get('ldavg-15', '0').replace(',', '.'))
                     })
-            except (ValueError, IndexError, KeyError):
+            except (ValueError, IndexError, KeyError) as e:
+                print(f"sar 데이터 라인 파싱 중 경미한 오류: {e} | 라인: '{line}'")
                 continue
                 
         return performance_data
@@ -1100,6 +1099,7 @@ class AIAnalyzer:
         # --- CPU 그래프 ---
         if perf_data.get('cpu') and len(perf_data['cpu']) > 1:
             try:
+                # CPU 데이터는 파서에서 이미 float으로 변환됨
                 cpu_data, timestamps = perf_data['cpu'], [d['timestamp'] for d in perf_data['cpu']]
                 user, system, iowait = [d['user'] for d in cpu_data], [d['system'] for d in cpu_data], [d['iowait'] for d in cpu_data]
                 
@@ -1131,7 +1131,14 @@ class AIAnalyzer:
                 timestamps = [d['timestamp'] for d in mem_data]
 
                 def get_float_data(key):
-                    return [float(d.get(key, 0.0)) for d in mem_data]
+                    values = []
+                    for d in mem_data:
+                        try:
+                            value_str = d.get(key, '0.0')
+                            values.append(float(value_str.replace(',', '.')))
+                        except (ValueError, TypeError):
+                            values.append(0.0)
+                    return values
 
                 kb_metrics = {
                     'kbmemfree': get_float_data('kbmemfree'),
@@ -1180,6 +1187,11 @@ class AIAnalyzer:
             
             network_graphs_generated = False
             for iface, data in network_by_iface.items():
+                state = interface_states.get(iface, 'UNKNOWN')
+                if state != 'UP':
+                    print(f"  - {iface} 인터페이스는 'State: UP' 상태가 아니므로 그래프를 건너뜁니다. (상태: {state})")
+                    continue
+
                 if len(data) < 2:
                     print(f"  - {iface} 인터페이스는 데이터 포인트가 부족하여 그래프를 건너뜁니다.")
                     continue
@@ -1187,10 +1199,9 @@ class AIAnalyzer:
                 try:
                     timestamps = [d['timestamp'] for d in data]
                     
-                    # sar 필드 이름 변형을 처리하는 헬퍼 함수
                     def get_flexible_net_data(d_list, key_patterns):
                         values = []
-                        # 첫 번째 데이터 항목에서 실제 키 찾기
+                        if not d_list: return []
                         actual_key = None
                         first_item = d_list[0]
                         for pattern in key_patterns:
@@ -1202,28 +1213,39 @@ class AIAnalyzer:
 
                         for d in d_list:
                             try:
-                                values.append(float(d.get(actual_key, 0.0)))
+                                value_str = d.get(actual_key, '0.0')
+                                values.append(float(value_str.replace(',', '.')))
                             except (ValueError, TypeError):
                                 values.append(0.0)
                         return values
 
+                    rxpck = get_flexible_net_data(data, ['rxpck_s', 'rxpck/s'])
+                    txpck = get_flexible_net_data(data, ['txpck_s', 'txpck/s'])
+                    rxkB = get_flexible_net_data(data, ['rxkB_s', 'rxkB/s'])
+                    txkB = get_flexible_net_data(data, ['txkB_s', 'txkB/s'])
+                    rxcmp = get_flexible_net_data(data, ['rxcmp_s', 'rxcmp/s'])
+                    txcmp = get_flexible_net_data(data, ['txcmp_s', 'txcmp/s'])
+                    rxmcst = get_flexible_net_data(data, ['rxmcst_s', 'rxmcst/s'])
+
+                    if all(v == 0.0 for v in rxpck + txpck + rxkB + txkB):
+                        print(f"  - ⚠️ {iface} 인터페이스의 sar 데이터가 모두 0입니다. 그래프가 비어 보일 수 있습니다.")
+
                     fig, ax1 = plt.subplots(figsize=(12, 6))
                     ax2 = ax1.twinx()
                     
-                    ax1.plot(timestamps, get_flexible_net_data(data, ['rxpck_s', 'rxpck/s']), label='rxpck/s', color='tab:blue', linestyle='-')
-                    ax1.plot(timestamps, get_flexible_net_data(data, ['txpck_s', 'txpck/s']), label='txpck/s', color='tab:cyan', linestyle='-')
-                    ax1.plot(timestamps, get_flexible_net_data(data, ['rxcmp_s', 'rxcmp/s']), label='rxcmp/s', color='tab:green', linestyle=':')
-                    ax1.plot(timestamps, get_flexible_net_data(data, ['txcmp_s', 'txcmp/s']), label='txcmp/s', color='limegreen', linestyle=':')
-                    ax1.plot(timestamps, get_flexible_net_data(data, ['rxmcst_s', 'rxmcst/s']), label='rxmcst/s', color='tab:gray', linestyle='--')
+                    ax1.plot(timestamps, rxpck, label='rxpck/s', color='tab:blue', linestyle='-')
+                    ax1.plot(timestamps, txpck, label='txpck/s', color='tab:cyan', linestyle='-')
+                    ax1.plot(timestamps, rxcmp, label='rxcmp/s', color='tab:green', linestyle=':')
+                    ax1.plot(timestamps, txcmp, label='txcmp/s', color='limegreen', linestyle=':')
+                    ax1.plot(timestamps, rxmcst, label='rxmcst/s', color='tab:gray', linestyle='--')
                     ax1.set_ylabel('Packets/s', color='tab:blue', fontsize=graph_style['label_fontsize'])
                     ax1.tick_params(axis='y', labelcolor='tab:blue')
 
-                    ax2.plot(timestamps, get_flexible_net_data(data, ['rxkB_s', 'rxkB/s']), label='rxkB/s', color='tab:red', linestyle='-')
-                    ax2.plot(timestamps, get_flexible_net_data(data, ['txkB_s', 'txkB/s']), label='txkB/s', color='tab:orange', linestyle='-')
+                    ax2.plot(timestamps, rxkB, label='rxkB/s', color='tab:red', linestyle='-')
+                    ax2.plot(timestamps, txkB, label='txkB/s', color='tab:orange', linestyle='-')
                     ax2.set_ylabel('kB/s', color='tab:red', fontsize=graph_style['label_fontsize'])
                     ax2.tick_params(axis='y', labelcolor='tab:red')
 
-                    state = interface_states.get(iface, 'UNKNOWN')
                     ax1.set_title(f'Network Traffic: {iface} (State: {state})', fontsize=graph_style['title_fontsize'], weight='bold')
                     ax1.xaxis.set_major_locator(mticker.MaxNLocator(nbins=10, prune='both'))
                     plt.setp(ax1.get_xticklabels(), rotation=graph_style['tick_rotation'], ha='right')
@@ -1245,7 +1267,15 @@ class AIAnalyzer:
                     traceback.print_exc()
 
             if not network_graphs_generated:
-                 graphs['network_graph_reason'] = "데이터 부족: sar 데이터에 유효한 네트워크 성능 정보가 없어 그래프를 생성할 수 없습니다."
+                up_interfaces_with_data = 0
+                for iface, data in network_by_iface.items():
+                    if interface_states.get(iface, 'UNKNOWN') == 'UP' and len(data) >= 2:
+                        up_interfaces_with_data += 1
+                
+                if up_interfaces_with_data == 0:
+                    graphs['network_graph_reason'] = "데이터 부족: 'State: UP' 상태이면서 유효한 성능 데이터를 가진 네트워크 인터페이스가 없습니다."
+                else:
+                    graphs['network_graph_reason'] = "데이터 부족: sar 데이터에 유효한 네트워크 성능 정보가 없어 그래프를 생성할 수 없습니다."
         else:
              graphs['network_graph_reason'] = "데이터 없음: sar 파일에서 관련 통계 정보를 찾을 수 없습니다."
         
@@ -1257,8 +1287,8 @@ class AIAnalyzer:
                     ts = d['timestamp']
                     if ts not in disk_agg: disk_agg[ts] = {'read_kb': 0.0, 'write_kb': 0.0}
                     try:
-                        disk_agg[ts]['read_kb'] += float(d.get('rkB_s', 0.0))
-                        disk_agg[ts]['write_kb'] += float(d.get('wkB_s', 0.0))
+                        disk_agg[ts]['read_kb'] += float(d.get('rkB_s', '0.0').replace(',', '.'))
+                        disk_agg[ts]['write_kb'] += float(d.get('wkB_s', '0.0').replace(',', '.'))
                     except (ValueError, TypeError):
                         pass
 
@@ -1291,6 +1321,7 @@ class AIAnalyzer:
         # --- Load Average 그래프 ---
         if perf_data.get('load') and len(perf_data['load']) > 1:
             try:
+                # Load Average 데이터는 파서에서 이미 float으로 변환됨
                 load_data, timestamps = perf_data['load'], [d['timestamp'] for d in perf_data['load']]
                 ldavg_1, ldavg_5, ldavg_15 = [d['ldavg-1'] for d in load_data], [d['ldavg-5'] for d in load_data], [d['ldavg-15'] for d in load_data]
 
@@ -1455,22 +1486,17 @@ class AIAnalyzer:
 
         # 네트워크 그래프를 위한 개선된 로직
         network_graph_keys = sorted([k for k in graphs.keys() if k.startswith('network_graph_')])
-        if 'network_graph_reason' in network_graph_keys:
+        if 'network_graph_reason' in graphs:
              graph_html += f'<div class="graph-container"><h3>Network Traffic</h3><p style="text-align:center; color: #888;">{html.escape(graphs["network_graph_reason"])}</p></div>'
-        else:
-            for key in network_graph_keys:
-                has_any_graph = True
-                # 제목 추출 로직 개선 (예: 'Network Traffic: eth0 (State: UP)')
-                # create_performance_graphs에서 생성한 제목을 그대로 사용할 수 있도록 html_template 수정 필요
-                # 여기서는 간단하게 처리
-                iface_name = html.escape(key.replace('network_graph_', ''))
-                # 실제 그래프 제목은 create_performance_graphs에서 생성되므로, 여기서는 컨테이너만 만듭니다.
-                # create_performance_graphs의 title을 가져와서 사용해야 합니다. 이 부분은 단순화를 위해 하드코딩합니다.
-                # 올바른 구현을 위해서는 `graphs` 딕셔너리에 제목도 함께 저장해야 합니다.
-                graph_title = f'Network Traffic ({iface_name})'
-                graph_html += f'<div class="graph-container"><h3>{graph_title}</h3><img src="data:image/png;base64,{graphs[key]}" alt="{graph_title} Graph"></div>'
+        
+        for key in network_graph_keys:
+            if key == 'network_graph_reason': continue
+            has_any_graph = True
+            iface_name = html.escape(key.replace('network_graph_', ''))
+            graph_title = f'Network Traffic ({iface_name})'
+            graph_html += f'<div class="graph-container"><h3>{graph_title}</h3><img src="data:image/png;base64,{graphs[key]}" alt="{graph_title} Graph"></div>'
 
-        if not has_any_graph:
+        if not has_any_graph and 'network_graph_reason' not in graphs:
             graph_html += "<p style='text-align:center;'>분석할 수 있는 성능 데이터가 부족하여 그래프를 생성할 수 없습니다.</p>"
         graph_html += '</div>'
         
