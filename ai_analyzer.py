@@ -416,64 +416,62 @@ class SosreportParser:
             {'path': f'var/log/sa/sar{self.report_full_date_str}'},
         ]
 
+        content = None
+        chosen_path = None
         for candidate in search_paths:
             file_path = self.base_path / candidate['path']
-            
             if file_path.exists():
-                print(f"  -> 파일 발견. 파싱 시도: {candidate['path']} (text)")
-                try:
-                    content = file_path.read_text(encoding='utf-8', errors='ignore')
-                    if not content.strip():
-                        print("    - 파일 내용이 비어있어 건너뜁니다.")
-                        continue
-
-                    performance_data = self._parse_sar_text_content(content)
-
-                    if any(v for v in performance_data.values() if v):
-                        num_cpu = len(performance_data.get('cpu', []))
-                        num_mem = len(performance_data.get('memory', []))
-                        # Network and disk are lists of dicts, we need to count unique timestamps
-                        num_net = len(set(d['timestamp'] for d in performance_data.get('network', [])))
-                        num_disk = len(set(d['timestamp'] for d in performance_data.get('disk', [])))
-                        num_load = len(performance_data.get('load', []))
-                        print(f"✅ 텍스트 sar 데이터 파싱 성공: {file_path.name} "
-                              f"(CPU: {num_cpu}, Mem: {num_mem}, Net: {num_net}, Disk: {num_disk}, Load: {num_load})")
-                        return performance_data
-                    else:
-                        print(f"    - {file_path.name} 파일에서 유효한 성능 데이터를 추출하지 못했습니다.")
-
-                except Exception as e:
-                    print(f"⚠️ 텍스트 sar 파일({file_path.name}) 파싱 중 오류 발생: {e}")
-    
-        print(f"  -> 지정된 형식의 sar 파일을 찾지 못했거나 파싱에 실패했습니다. 종합 sar 데이터(sar -A)로 대체합니다.")
-        sar_A_content = self._read_file(['sos_commands/monitoring/sar_-A'])
-        if sar_A_content != 'N/A' and sar_A_content.strip():
-            performance_data = self._parse_sar_text_content(sar_A_content)
-            if any(performance_data.values()):
-                num_cpu = len(performance_data.get('cpu', []))
-                num_mem = len(performance_data.get('memory', []))
-                num_net = len(set(d['timestamp'] for d in performance_data.get('network', [])))
-                num_disk = len(set(d['timestamp'] for d in performance_data.get('disk', [])))
-                num_load = len(performance_data.get('load', []))
-                print(f"✅ 종합 sar 데이터(sar -A) 파싱 완료. "
-                      f"(CPU: {num_cpu}, Mem: {num_mem}, Net: {num_net}, Disk: {num_disk}, Load: {num_load})")
-                return performance_data
+                print(f"  -> sar 파일 발견: {candidate['path']}")
+                content = file_path.read_text(encoding='utf-8', errors='ignore')
+                chosen_path = candidate['path']
+                if content.strip():
+                    break
         
-        print("❌ 분석할 수 있는 sar 데이터를 찾지 못했습니다.")
-        return {'cpu': [], 'memory': [], 'network': [], 'disk': [], 'load': []}
+        if not content or not content.strip():
+            print("  -> 일반 경로에서 sar 파일을 찾지 못했거나 비어있어, 종합 sar 데이터(sar -A)로 대체합니다.")
+            content = self._read_file(['sos_commands/monitoring/sar_-A'])
+            chosen_path = 'sos_commands/monitoring/sar_-A'
+            if content == 'N/A' or not content.strip():
+                print("❌ 분석할 수 있는 sar 데이터를 찾지 못했습니다.")
+                return {'cpu': [], 'memory': [], 'network': [], 'disk': [], 'load': []}
+
+        # --- 데이터 유무 진단 ---
+        if 'IFACE' not in content:
+            print("⚠️ 경고: sar 파일에 네트워크 통계(-n DEV) 섹션이 없습니다. 관련 데이터 수집 설정이 비활성화되었을 수 있습니다.")
+        if 'CPU' not in content and '%user' not in content:
+            print("⚠️ 경고: sar 파일에 CPU 통계(-u) 섹션이 없습니다.")
+        if 'kbmemfree' not in content:
+            print("⚠️ 경고: sar 파일에 메모리 통계(-r) 섹션이 없습니다.")
+
+        performance_data = self._parse_sar_text_content(content)
+
+        if any(v for v in performance_data.values() if v):
+            num_cpu = len(performance_data.get('cpu', []))
+            num_mem = len(performance_data.get('memory', []))
+            num_net = len(set(d.get('timestamp') for d in performance_data.get('network', [])))
+            num_disk = len(set(d.get('timestamp') for d in performance_data.get('disk', [])))
+            num_load = len(performance_data.get('load', []))
+            print(f"✅ sar 데이터 파싱 성공: {chosen_path} "
+                  f"(CPU: {num_cpu}, Mem: {num_mem}, Net: {num_net}, Disk: {num_disk}, Load: {num_load})")
+            return performance_data
+        else:
+            print(f"    - {chosen_path} 파일에서 유효한 성능 데이터를 추출하지 못했습니다.")
+            return {'cpu': [], 'memory': [], 'network': [], 'disk': [], 'load': []}
+
 
     def _parse_sar_text_content(self, sar_content: str) -> Dict[str, List[Dict[str, Any]]]:
-        """ksar의 원리를 적용하여, 헤더와 데이터 라인을 지능적으로 식별하고 상세 데이터를 파싱합니다."""
-        performance_data = {
-            'cpu': [], 'memory': [], 'network': [], 'disk': [], 'load': []
-        }
-        context = {'section': None, 'header_map': {}}
+        """향상된 sar 텍스트 파서: 동적 헤더 분석을 통해 다양한 sar 출력 형식에 대응합니다."""
+        performance_data = {'cpu': [], 'memory': [], 'network': [], 'disk': [], 'load': []}
+        
+        current_section = None
+        header_map = {}
 
         lines = sar_content.split('\n')
         for line in lines:
             line = line.strip()
             if not line or 'Linux' in line or 'Average:' in line:
-                context['section'] = None
+                current_section = None
+                header_map = {}
                 continue
 
             ts_match = re.match(r'(\d{2}:\d{2}:\d{2}(?:\s+(?:AM|PM))?)', line)
@@ -481,90 +479,64 @@ class SosreportParser:
                 continue
             
             timestamp = ts_match.group(1)
-            parts = line.split()
+            parts = re.split(r'\s+', line.strip())
 
-            # Determine if the line is a header
-            is_header = False
-            # Header lines have specific keyword combinations and mostly non-numeric parts after the timestamp
-            non_ts_parts = line[len(timestamp):].strip().split()
-            if any(p.isalpha() for p in non_ts_parts):
-                 if ('CPU' in parts and '%usr' in parts) or \
-                   ('IFACE' in parts and 'rxpck/s' in parts) or \
-                   ('kbmemfree' in parts and '%memused' in parts) or \
-                   ('tps' in parts and 'bread/s' in parts) or \
-                   ('DEV' in parts and 'tps' in parts) or \
-                   ('runq-sz' in parts and 'ldavg-1' in parts):
-                    is_header = True
-
-            if is_header:
-                if 'CPU' in parts and '%usr' in parts: context['section'] = 'cpu'
-                elif 'IFACE' in parts and 'rxpck/s' in parts: context['section'] = 'net'
-                elif 'kbmemfree' in parts: context['section'] = 'mem'
-                elif 'tps' in parts and 'bread/s' in parts: context['section'] = 'disk_b'
-                elif 'DEV' in parts and 'tps' in parts: context['section'] = 'disk_d'
-                elif 'ldavg-1' in parts: context['section'] = 'load'
-                else: context['section'] = None
-                
-                if context['section']:
-                    context['header_map'] = {header.replace('/', '_s'): i for i, header in enumerate(parts)}
-                continue
-
-            if not context.get('section') or not context.get('header_map'):
-                continue
+            # --- 헤더 라인 식별 및 분석 ---
+            is_header = any(p.isalpha() and p not in ["AM", "PM", "all"] for p in parts[1:])
             
-            h_map = context['header_map']
+            if is_header:
+                header_map = {}
+                raw_header_parts = parts
+                
+                # 섹션 결정
+                if 'CPU' in raw_header_parts and any('%' in p for p in raw_header_parts): current_section = 'cpu'
+                elif 'IFACE' in raw_header_parts: current_section = 'net'
+                elif 'kbmemfree' in raw_header_parts: current_section = 'mem'
+                elif 'DEV' in raw_header_parts and 'tps' in raw_header_parts: current_section = 'disk'
+                elif 'runq-sz' in raw_header_parts: current_section = 'load'
+                else: current_section = None
+                
+                if current_section:
+                    for i, header in enumerate(raw_header_parts):
+                        normalized_header = header.replace('%', 'pct_').replace('/', '_s')
+                        header_map[normalized_header] = i
+                continue
+
+            # --- 데이터 라인 파싱 ---
+            if not current_section or not header_map:
+                continue
+
             try:
                 entry = {'timestamp': timestamp}
-                data_parts = parts[len(timestamp.split()):] # Get parts after the timestamp
-                header_keys = sorted(h_map, key=h_map.get) # Get headers in order
+                for key, index in header_map.items():
+                    if index < len(parts):
+                        entry[key] = parts[index]
                 
-                # Find the starting index of actual data based on header
-                # This handles cases like 'all', 'eth0' etc.
-                start_data_idx = 0
-                for i, p in enumerate(data_parts):
-                    if p.replace('.', '', 1).isdigit():
-                        start_data_idx = i
-                        break
-
-                key_offset = h_map[header_keys[start_data_idx + len(timestamp.split())]] - start_data_idx
-                
-                for key, index in h_map.items():
-                    data_idx = index - key_offset
-                    if 0 <= data_idx < len(data_parts):
-                        entry[key] = data_parts[data_idx]
-                
-                if 'IFACE' in h_map: entry['IFACE'] = data_parts[h_map['IFACE'] - key_offset]
-                if 'DEV' in h_map: entry['DEV'] = data_parts[h_map['DEV'] - key_offset]
-
-
-                if context['section'] == 'cpu' and 'all' in parts:
+                # 섹션별 데이터 저장
+                if current_section == 'cpu' and entry.get('CPU') == 'all':
                     performance_data['cpu'].append({
                         'timestamp': timestamp,
-                        'user': float(entry.get('%usr', entry.get('%user', 0))),
-                        'system': float(entry.get('%sys', entry.get('%system', 0))),
-                        'iowait': float(entry.get('%iowait', 0)),
-                        'idle': float(entry.get('%idle', 0))
+                        'user': float(entry.get('pct_user', 0)),
+                        'system': float(entry.get('pct_sys', 0)),
+                        'iowait': float(entry.get('pct_iowait', 0)),
+                        'idle': float(entry.get('pct_idle', 0))
                     })
-                elif context['section'] == 'mem':
+                elif current_section == 'mem':
                     performance_data['memory'].append(entry)
-
-                elif context['section'] == 'net' and entry.get('IFACE') != 'lo':
+                elif current_section == 'net' and entry.get('IFACE') != 'lo':
                     performance_data['network'].append(entry)
-
-                elif context['section'] in ['disk_b', 'disk_d']:
+                elif current_section == 'disk':
                     performance_data['disk'].append(entry)
-
-                elif context['section'] == 'load':
+                elif current_section == 'load':
                     performance_data['load'].append({
                         'timestamp': timestamp,
                         'ldavg-1': float(entry.get('ldavg-1', 0)),
                         'ldavg-5': float(entry.get('ldavg-5', 0)),
                         'ldavg-15': float(entry.get('ldavg-15', 0))
                     })
-            except (ValueError, IndexError, KeyError) as e:
-                # print(f"DEBUG: Skipping line due to error: {e} | Line: '{line}' | Context: {context}")
+            except (ValueError, IndexError, KeyError):
                 continue
-        
+                
         return performance_data
 
 
@@ -1094,7 +1066,7 @@ class AIAnalyzer:
 
         graph_style = {
             'figsize': (12, 6), 'title_fontsize': 16, 'label_fontsize': 12,
-            'tick_rotation': 30, 'alpha': 0.3
+            'tick_rotation': 30, 'alpha': 0.7
         }
         
         # --- CPU 그래프 ---
@@ -1124,118 +1096,186 @@ class AIAnalyzer:
             except Exception as e:
                 print(f"  - ⚠️ CPU 그래프 생성 실패: {e}")
 
-        # --- 메모리(RAM) 그래프 ---
+        # --- 메모리(RAM) 상세 그래프 ---
         if perf_data.get('memory') and len(perf_data['memory']) > 1:
             try:
-                mem_data, timestamps = perf_data['memory'], [d['timestamp'] for d in perf_data['memory']]
-                mem_used = [float(d.get('%memused', 0)) for d in mem_data]
+                mem_data = perf_data['memory']
+                timestamps = [d['timestamp'] for d in mem_data]
+
+                def get_float_data(key):
+                    return [float(d.get(key, 0.0)) for d in mem_data]
+
+                kb_metrics = {
+                    'kbmemfree': get_float_data('kbmemfree'),
+                    'kbmemused': get_float_data('kbmemused'),
+                    'kbbuffers': get_float_data('kbbuffers'),
+                    'kbcached': get_float_data('kbcached'),
+                    'kbcommit': get_float_data('kbcommit'),
+                    'kbactive': get_float_data('kbactive'),
+                    'kbinact': get_float_data('kbinact'),
+                    'kbdirty': get_float_data('kbdirty')
+                }
                 
                 fig, ax = plt.subplots(figsize=graph_style['figsize'])
-                ax.plot(timestamps, mem_used, color='#55A868', lw=2)
-                ax.fill_between(timestamps, mem_used, color='#55A868', alpha=graph_style['alpha'])
+                
+                for key, values in kb_metrics.items():
+                    ax.plot(timestamps, values, label=key, lw=2)
+                
+                ax.set_title('메모리 사용량 (KB)', fontsize=graph_style['title_fontsize'], weight='bold')
+                ax.set_ylabel('Kilobytes', fontsize=graph_style['label_fontsize'])
+                ax.legend(loc='upper left', frameon=True, fontsize='small', ncol=2)
+                ax.grid(True)
 
-                ax.set_title('메모리 사용률 (%)', fontsize=graph_style['title_fontsize'], weight='bold')
-                ax.set_ylabel('사용률 (%)', fontsize=graph_style['label_fontsize'])
-                ax.set_ylim(0, 100)
                 ax.xaxis.set_major_locator(mticker.MaxNLocator(nbins=10, prune='both'))
                 plt.xticks(rotation=graph_style['tick_rotation'], ha='right')
+                
                 plt.tight_layout()
 
                 buf = io.BytesIO()
                 fig.savefig(buf, format='png', dpi=100)
                 graphs['memory_graph'] = base64.b64encode(buf.getvalue()).decode('utf-8')
                 plt.close(fig)
-                print("  - 메모리 그래프 생성 완료")
+                print("  - 메모리 통합 라인 그래프 생성 완료")
             except Exception as e:
                 print(f"  - ⚠️ 메모리 그래프 생성 실패: {e}")
 
-        # --- 네트워크 그래프 (개선된 로직) ---
+        # --- 네트워크 그래프 (인터페이스별 상세 + 전체 통합 Fallback) ---
         if perf_data.get('network') and len(perf_data['network']) > 1:
+            network_graphs_generated = False
             try:
-                net_agg = {}
+                network_by_iface = {}
                 for d in perf_data['network']:
-                    ts = d['timestamp']
-                    if ts not in net_agg: net_agg[ts] = {'rx_kb': 0.0, 'tx_kb': 0.0}
+                    iface = d.get('IFACE')
+                    if not iface or iface == 'lo': continue
+                    if iface not in network_by_iface: network_by_iface[iface] = []
+                    network_by_iface[iface].append(d)
+
+                for iface, data in network_by_iface.items():
+                    if len(data) < 2: continue
+                    timestamps = [d['timestamp'] for d in data]
                     
-                    # 여러 가능한 키 이름을 확인 ('rxkB/s' -> 'rxkB_s', 'rkB/s' -> 'rkB_s')
-                    rx_val = d.get('rxkB_s', d.get('rkB_s'))
-                    tx_val = d.get('txkB_s', d.get('tkB_s'))
+                    def get_net_data(key):
+                        values = []
+                        for d in data:
+                            try:
+                                values.append(float(d.get(key, 0.0)))
+                            except (ValueError, TypeError):
+                                values.append(0.0)
+                        return values
 
-                    if rx_val is not None: net_agg[ts]['rx_kb'] += float(rx_val)
-                    if tx_val is not None: net_agg[ts]['tx_kb'] += float(tx_val)
-                
-                net_data = sorted([{'timestamp': ts, **data} for ts, data in net_agg.items()], key=lambda x: x['timestamp'])
-                timestamps = [d['timestamp'] for d in net_data]
-                rxkB, txkB = [d['rx_kb'] for d in net_data], [d['tx_kb'] for d in net_data]
+                    fig, ax1 = plt.subplots(figsize=(12, 6))
+                    ax2 = ax1.twinx()
+                    
+                    ax1.plot(timestamps, get_net_data('rxpck_s'), label='rxpck/s', color='tab:blue', linestyle='-')
+                    ax1.plot(timestamps, get_net_data('txpck_s'), label='txpck/s', color='tab:cyan', linestyle='-')
+                    ax1.plot(timestamps, get_net_data('rxcmp_s'), label='rxcmp/s', color='tab:green', linestyle=':')
+                    ax1.plot(timestamps, get_net_data('txcmp_s'), label='txcmp/s', color='tab:lime', linestyle=':')
+                    ax1.plot(timestamps, get_net_data('rxmcst_s'), label='rxmcst/s', color='tab:gray', linestyle='--')
+                    ax1.set_ylabel('Packets/s', color='tab:blue', fontsize=graph_style['label_fontsize'])
+                    ax1.tick_params(axis='y', labelcolor='tab:blue')
 
-                fig, ax = plt.subplots(figsize=graph_style['figsize'])
-                ax.plot(timestamps, rxkB, color='#8172B3', lw=2, label='수신 (kB/s)')
-                ax.fill_between(timestamps, rxkB, color='#8172B3', alpha=graph_style['alpha'])
-                ax.plot(timestamps, txkB, color='#CCB974', lw=2, label='송신 (kB/s)')
-                ax.fill_between(timestamps, txkB, color='#CCB974', alpha=graph_style['alpha'])
+                    ax2.plot(timestamps, get_net_data('rxkB_s'), label='rxkB/s', color='tab:red', linestyle='-')
+                    ax2.plot(timestamps, get_net_data('txkB_s'), label='txkB/s', color='tab:orange', linestyle='-')
+                    ax2.set_ylabel('kB/s', color='tab:red', fontsize=graph_style['label_fontsize'])
+                    ax2.tick_params(axis='y', labelcolor='tab:red')
 
-                ax.set_title('네트워크 트래픽 (kB/s)', fontsize=graph_style['title_fontsize'], weight='bold')
-                ax.set_ylabel('kB/s', fontsize=graph_style['label_fontsize'])
-                ax.legend(loc='upper left', frameon=True)
-                ax.xaxis.set_major_locator(mticker.MaxNLocator(nbins=10, prune='both'))
-                plt.xticks(rotation=graph_style['tick_rotation'], ha='right')
-                plt.tight_layout()
+                    ax1.set_title(f'네트워크 트래픽: {iface}', fontsize=graph_style['title_fontsize'], weight='bold')
+                    ax1.xaxis.set_major_locator(mticker.MaxNLocator(nbins=10, prune='both'))
+                    plt.setp(ax1.get_xticklabels(), rotation=graph_style['tick_rotation'], ha='right')
 
-                buf = io.BytesIO()
-                fig.savefig(buf, format='png', dpi=100)
-                graphs['network_graph'] = base64.b64encode(buf.getvalue()).decode('utf-8')
-                plt.close(fig)
-                print("  - 네트워크 그래프 생성 완료")
+                    lines1, labels1 = ax1.get_legend_handles_labels()
+                    lines2, labels2 = ax2.get_legend_handles_labels()
+                    ax1.legend(lines1 + lines2, labels1 + labels2, loc='upper left', frameon=True, ncol=2, fontsize='small')
+                    plt.tight_layout()
+                    
+                    buf = io.BytesIO()
+                    fig.savefig(buf, format='png', dpi=100)
+                    graphs[f"network_graph_{iface}"] = base64.b64encode(buf.getvalue()).decode('utf-8')
+                    plt.close(fig)
+                    network_graphs_generated = True
+                    print(f"  - 상세 네트워크 그래프 생성 완료: {iface}")
             except Exception as e:
-                print(f"  - ⚠️ 네트워크 그래프 생성 실패: {e}")
+                print(f"  - ⚠️ 상세 네트워크 그래프 생성 중 오류: {e}")
+                import traceback
+                traceback.print_exc()
 
-        # --- 디스크 I/O 그래프 (개선된 로직) ---
+            if not network_graphs_generated and perf_data.get('network'):
+                print("  -> 상세 네트워크 그래프 생성 실패. 전체 통합 그래프로 대체합니다.")
+                try:
+                    net_agg = {}
+                    for d in perf_data['network']:
+                        ts = d['timestamp']
+                        if ts not in net_agg: net_agg[ts] = {'rx_kb': 0.0, 'tx_kb': 0.0}
+                        try:
+                            net_agg[ts]['rx_kb'] += float(d.get('rxkB_s', 0.0))
+                            net_agg[ts]['tx_kb'] += float(d.get('txkB_s', 0.0))
+                        except (ValueError, TypeError):
+                            pass
+                    
+                    net_data = sorted([{'timestamp': ts, **data} for ts, data in net_agg.items()], key=lambda x: x['timestamp'])
+                    if len(net_data) > 1:
+                        timestamps = [d['timestamp'] for d in net_data]
+                        rxkB, txkB = [d['rx_kb'] for d in net_data], [d['tx_kb'] for d in net_data]
+
+                        fig, ax = plt.subplots(figsize=graph_style['figsize'])
+                        ax.plot(timestamps, rxkB, color='#8172B3', lw=2, label='전체 수신 (kB/s)')
+                        ax.fill_between(timestamps, rxkB, color='#8172B3', alpha=graph_style['alpha'])
+                        ax.plot(timestamps, txkB, color='#CCB974', lw=2, label='전체 송신 (kB/s)')
+                        ax.fill_between(timestamps, txkB, color='#CCB974', alpha=graph_style['alpha'])
+
+                        ax.set_title('전체 네트워크 트래픽 (kB/s)', fontsize=graph_style['title_fontsize'], weight='bold')
+                        ax.set_ylabel('kB/s', fontsize=graph_style['label_fontsize'])
+                        ax.legend(loc='upper left', frameon=True)
+                        ax.xaxis.set_major_locator(mticker.MaxNLocator(nbins=10, prune='both'))
+                        plt.xticks(rotation=graph_style['tick_rotation'], ha='right')
+                        plt.tight_layout()
+
+                        buf = io.BytesIO()
+                        fig.savefig(buf, format='png', dpi=100)
+                        graphs['network_graph_total'] = base64.b64encode(buf.getvalue()).decode('utf-8')
+                        plt.close(fig)
+                        print("  - 전체 통합 네트워크 그래프 생성 완료.")
+                except Exception as e_fallback:
+                    print(f"  - ⚠️ 전체 통합 네트워크 그래프 생성조차 실패: {e_fallback}")
+        else:
+             graphs['network_graph_reason'] = "데이터 없음: sar 파일에서 관련 통계 정보를 찾을 수 없습니다."
+        
+        # --- 디스크 I/O 그래프 ---
         if perf_data.get('disk') and len(perf_data['disk']) > 1:
             try:
                 disk_agg = {}
                 for d in perf_data['disk']:
                     ts = d['timestamp']
                     if ts not in disk_agg: disk_agg[ts] = {'read_kb': 0.0, 'write_kb': 0.0}
-
-                    # bread/s, bwrtn/s (블록) -> kB/s 변환 (1 block = 512 bytes = 0.5 kB)
-                    # rkB/s, wkB/s 는 그대로 사용
-                    read_val_block = d.get('bread_s')
-                    write_val_block = d.get('bwrtn_s')
-                    
-                    if read_val_block is not None:
-                        disk_agg[ts]['read_kb'] += float(read_val_block) * 0.5
-                    else:
-                        read_val_kb = d.get('rkB_s')
-                        if read_val_kb is not None: disk_agg[ts]['read_kb'] += float(read_val_kb)
-
-                    if write_val_block is not None:
-                         disk_agg[ts]['write_kb'] += float(write_val_block) * 0.5
-                    else:
-                        write_val_kb = d.get('wkB_s')
-                        if write_val_kb is not None: disk_agg[ts]['write_kb'] += float(write_val_kb)
+                    try:
+                        disk_agg[ts]['read_kb'] += float(d.get('rkB_s', 0.0))
+                        disk_agg[ts]['write_kb'] += float(d.get('wkB_s', 0.0))
+                    except (ValueError, TypeError):
+                        pass
 
                 disk_data = sorted([{'timestamp': ts, **data} for ts, data in disk_agg.items()], key=lambda x: x['timestamp'])
-                timestamps = [d['timestamp'] for d in disk_data]
-                read_kB, write_kB = [d['read_kb'] for d in disk_data], [d['write_kb'] for d in disk_data]
+                if len(disk_data) > 1:
+                    timestamps = [d['timestamp'] for d in disk_data]
+                    read_kB, write_kB = [d['read_kb'] for d in disk_data], [d['write_kb'] for d in disk_data]
 
-                fig, ax = plt.subplots(figsize=graph_style['figsize'])
-                ax.plot(timestamps, read_kB, color='#64B5CD', lw=2, label='읽기 (kB/s)')
-                ax.fill_between(timestamps, read_kB, color='#64B5CD', alpha=graph_style['alpha'])
-                ax.plot(timestamps, write_kB, color='#C44E52', lw=2, label='쓰기 (kB/s)')
-                ax.fill_between(timestamps, write_kB, color='#C44E52', alpha=graph_style['alpha'])
+                    fig, ax = plt.subplots(figsize=graph_style['figsize'])
+                    ax.plot(timestamps, read_kB, color='#64B5CD', lw=2, label='읽기 (kB/s)')
+                    ax.fill_between(timestamps, read_kB, color='#64B5CD', alpha=graph_style['alpha'])
+                    ax.plot(timestamps, write_kB, color='#C44E52', lw=2, label='쓰기 (kB/s)')
+                    ax.fill_between(timestamps, write_kB, color='#C44E52', alpha=graph_style['alpha'])
 
-                ax.set_title('디스크 I/O (kB/s)', fontsize=graph_style['title_fontsize'], weight='bold')
-                ax.set_ylabel('kB/s', fontsize=graph_style['label_fontsize'])
-                ax.legend(loc='upper left', frameon=True)
-                ax.xaxis.set_major_locator(mticker.MaxNLocator(nbins=10, prune='both'))
-                plt.xticks(rotation=graph_style['tick_rotation'], ha='right')
-                plt.tight_layout()
+                    ax.set_title('디스크 I/O (kB/s)', fontsize=graph_style['title_fontsize'], weight='bold')
+                    ax.set_ylabel('kB/s', fontsize=graph_style['label_fontsize'])
+                    ax.legend(loc='upper left', frameon=True)
+                    ax.xaxis.set_major_locator(mticker.MaxNLocator(nbins=10, prune='both'))
+                    plt.xticks(rotation=graph_style['tick_rotation'], ha='right')
+                    plt.tight_layout()
 
-                buf = io.BytesIO()
-                fig.savefig(buf, format='png', dpi=100)
-                graphs['disk_graph'] = base64.b64encode(buf.getvalue()).decode('utf-8')
-                plt.close(fig)
-                print("  - 디스크 I/O 그래프 생성 완료")
+                    buf = io.BytesIO()
+                    fig.savefig(buf, format='png', dpi=100)
+                    graphs['disk_graph'] = base64.b64encode(buf.getvalue()).decode('utf-8')
+                    plt.close(fig)
+                    print("  - 디스크 I/O 그래프 생성 완료")
             except Exception as e:
                 print(f"  - ⚠️ 디스크 I/O 그래프 생성 실패: {e}")
         
@@ -1391,17 +1431,38 @@ class AIAnalyzer:
         
         graph_html = ""
         graph_html += '<div class="section"><h2>📊 성능 분석 요약</h2>'
-        graph_items = {
-            'cpu_graph': 'CPU 사용률', 'memory_graph': '메모리 사용률', 
-            'load_average_graph': 'System Load Average', 'network_graph': '네트워크 트래픽', 
+        
+        static_graph_items = {
+            'cpu_graph': 'CPU 사용률', 
+            'memory_graph': '메모리 사용량 (KB)', 
+            'load_average_graph': 'System Load Average',
             'disk_graph': '디스크 I/O'
         }
         has_any_graph = False
-        for key, title in graph_items.items():
+        for key, title in static_graph_items.items():
             if key in graphs:
                 has_any_graph = True
                 graph_html += f'<div class="graph-container"><h3>{title}</h3><img src="data:image/png;base64,{graphs[key]}" alt="{title} Graph"></div>'
+
+        sorted_graph_keys = sorted(graphs.keys())
+        network_graph_added = False
+        for key in sorted_graph_keys:
+            if key.startswith('network_graph_'):
+                if key == 'network_graph_reason':
+                    graph_html += f'<div class="graph-container"><h3>네트워크 트래픽</h3><p style="text-align:center; color: #888;">{html.escape(graphs[key])}</p></div>'
+                    network_graph_added = True
+                    continue
+
+                network_graph_added = True
+                title = '네트워크 트래픽'
+                if key != 'network_graph_total':
+                    iface_name = html.escape(key.replace('network_graph_', ''))
+                    title = f'네트워크 트래픽 ({iface_name})'
+                
+                graph_html += f'<div class="graph-container"><h3>{title}</h3><img src="data:image/png;base64,{graphs[key]}" alt="{title} Graph"></div>'
         
+        if network_graph_added: has_any_graph = True
+
         if not has_any_graph:
             graph_html += "<p style='text-align:center;'>분석할 수 있는 성능 데이터가 부족하여 그래프를 생성할 수 없습니다.</p>"
         graph_html += '</div>'
@@ -1579,7 +1640,7 @@ def main():
         sys.exit(0)
 
     if args.test_only:
-        if not args.model: parser.error("--test-only 옵션은 --model 인자가 필요합니다.")
+        if not args.model: parser.error("--test_only 옵션은 --model 인자가 필요합니다.")
         if analyzer.check_llm_service() and analyzer.test_llm_connection():
             print("\n✅ LLM 서비스가 정상적으로 작동합니다.")
         else:
