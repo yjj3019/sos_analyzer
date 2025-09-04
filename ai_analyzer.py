@@ -458,7 +458,6 @@ class SosreportParser:
             print(f"    - {chosen_path} 파일에서 유효한 성능 데이터를 추출하지 못했습니다.")
             return {'cpu': [], 'memory': [], 'network': [], 'disk': [], 'load': []}
 
-
     def _parse_sar_text_content(self, sar_content: str) -> Dict[str, List[Dict[str, Any]]]:
         """
         고도화된 sar 텍스트 파서. 데이터 블록을 명확히 인지하여 다양한 sar 출력 형식에 안정적으로 대응합니다.
@@ -467,26 +466,14 @@ class SosreportParser:
         performance_data = {'cpu': [], 'memory': [], 'network': [], 'disk': [], 'load': []}
         lines = sar_content.strip().replace('\r\n', '\n').split('\n')
         
-        header_cols = []
         header_map = {}
         current_section = None
-
-        section_map = {
-            ('CPU', '%user'): 'cpu',
-            ('IFACE',): 'net',
-            ('kbmemfree',): 'mem',
-            ('DEV', 'tps'): 'disk',
-            ('runq-sz',): 'load',
-        }
 
         for line in lines:
             line = line.strip()
 
-            if not line or line.startswith('Average:'):
-                header_cols, header_map, current_section = [], {}, None
-                continue
-            
-            if line.startswith('Linux'):
+            if not line or line.startswith('Average:') or line.startswith('Linux'):
+                header_map, current_section = {}, None
                 continue
 
             ts_match = re.match(r'^(\d{2}:\d{2}:\d{2}(?:\s+AM|\s+PM)?)', line)
@@ -494,23 +481,31 @@ class SosreportParser:
                 continue
 
             parts = re.split(r'\s+', line)
-            is_header = any(kw in parts for kw in ['CPU', 'IFACE', 'kbmemfree', 'DEV', 'runq-sz', '%user', 'rxpck/s'])
+            
+            # 타임스탬프와 AM/PM을 제외한 실제 컬럼명 찾기
+            metric_cols_start_index = 1
+            if len(parts) > 1 and parts[1] in ['AM', 'PM']:
+                metric_cols_start_index = 2
+            
+            metric_cols = parts[metric_cols_start_index:]
+            
+            # 헤더인지 데이터인지 판별 (헤더는 문자로만 구성된 경향이 있음)
+            is_header = any(col.isalpha() or '%' in col or '/' in col for col in metric_cols) and \
+                        not any(re.match(r'^\d+[,.]\d+$', col) for col in metric_cols)
 
             if is_header:
-                header_cols = parts
                 current_section = None
-                
-                # 타임스탬프와 AM/PM을 제외한 실제 컬럼명 찾기
-                metric_cols_start_index = 1
-                if len(parts) > 1 and parts[1] in ['AM', 'PM']:
-                    metric_cols_start_index = 2
-                
-                metric_cols = header_cols[metric_cols_start_index:]
-
-                for keywords, section_name in section_map.items():
-                    if all(kw in metric_cols for kw in keywords):
-                        current_section = section_name
-                        break
+                # 섹션 결정
+                if '%user' in metric_cols and '%system' in metric_cols:
+                    current_section = 'cpu'
+                elif 'IFACE' in metric_cols:
+                    current_section = 'net'
+                elif 'kbmemfree' in metric_cols:
+                    current_section = 'mem'
+                elif 'DEV' in metric_cols and 'tps' in metric_cols:
+                    current_section = 'disk'
+                elif 'runq-sz' in metric_cols:
+                    current_section = 'load'
                 
                 if current_section:
                     header_map = {}
@@ -523,8 +518,7 @@ class SosreportParser:
                 continue
             
             timestamp = ts_match.group(1)
-            data_values_str = line[ts_match.end():].strip()
-            data_values = re.split(r'\s+', data_values_str)
+            data_values = metric_cols
 
             try:
                 entry = {'timestamp': timestamp}
@@ -532,14 +526,18 @@ class SosreportParser:
                     if index < len(data_values):
                         entry[key] = data_values[index]
 
-                if current_section == 'cpu' and entry.get('CPU') == 'all':
-                    performance_data['cpu'].append({
-                        'timestamp': timestamp,
-                        'user': float(entry.get('pct_user', '0').replace(',', '.')),
-                        'system': float(entry.get('pct_sys', '0').replace(',', '.')),
-                        'iowait': float(entry.get('pct_iowait', '0').replace(',', '.')),
-                        'idle': float(entry.get('pct_idle', '0').replace(',', '.'))
-                    })
+                if current_section == 'cpu':
+                    is_all_row = ('CPU' in entry and entry['CPU'] == 'all') or \
+                                 ('CPU' not in header_map and data_values[0] == 'all')
+
+                    if is_all_row:
+                        performance_data['cpu'].append({
+                            'timestamp': timestamp,
+                            'user': float(entry.get('pct_user', '0').replace(',', '.')),
+                            'system': float(entry.get('pct_sys', '0').replace(',', '.')),
+                            'iowait': float(entry.get('pct_iowait', '0').replace(',', '.')),
+                            'idle': float(entry.get('pct_idle', '0').replace(',', '.'))
+                        })
                 elif current_section == 'mem':
                     performance_data['memory'].append(entry)
                 elif current_section == 'net' and entry.get('IFACE') != 'lo':
