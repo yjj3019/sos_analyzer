@@ -460,60 +460,78 @@ class SosreportParser:
 
 
     def _parse_sar_text_content(self, sar_content: str) -> Dict[str, List[Dict[str, Any]]]:
-        """향상된 sar 텍스트 파서: 동적 헤더 분석을 통해 다양한 sar 출력 형식에 대응합니다."""
+        """
+        고도화된 sar 텍스트 파서. 데이터 블록을 명확히 인지하여 다양한 sar 출력 형식에 안정적으로 대응합니다.
+        """
+        print("  -> 고도화된 sar 파서 실행 중...")
         performance_data = {'cpu': [], 'memory': [], 'network': [], 'disk': [], 'load': []}
+        lines = sar_content.strip().replace('\r\n', '\n').split('\n')
         
-        current_section = None
+        header_cols = []
         header_map = {}
+        current_section = None
 
-        lines = sar_content.split('\n')
+        section_map = {
+            ('CPU', '%user'): 'cpu',
+            ('IFACE',): 'net',
+            ('kbmemfree',): 'mem',
+            ('DEV', 'tps'): 'disk',
+            ('runq-sz',): 'load',
+        }
+
         for line in lines:
             line = line.strip()
-            if not line or 'Linux' in line or 'Average:' in line:
-                current_section = None
-                header_map = {}
+
+            if not line or line.startswith('Average:'):
+                header_cols, header_map, current_section = [], {}, None
+                continue
+            
+            if line.startswith('Linux'):
                 continue
 
-            ts_match = re.match(r'(\d{2}:\d{2}:\d{2}(?:\s+(?:AM|PM))?)', line)
+            ts_match = re.match(r'^(\d{2}:\d{2}:\d{2}(?:\s+AM|\s+PM)?)', line)
             if not ts_match:
+                continue
+
+            parts = re.split(r'\s+', line)
+            is_header = any(kw in parts for kw in ['CPU', 'IFACE', 'kbmemfree', 'DEV', 'runq-sz', '%user', 'rxpck/s'])
+
+            if is_header:
+                header_cols = parts
+                current_section = None
+                
+                # 타임스탬프와 AM/PM을 제외한 실제 컬럼명 찾기
+                metric_cols_start_index = 1
+                if len(parts) > 1 and parts[1] in ['AM', 'PM']:
+                    metric_cols_start_index = 2
+                
+                metric_cols = header_cols[metric_cols_start_index:]
+
+                for keywords, section_name in section_map.items():
+                    if all(kw in metric_cols for kw in keywords):
+                        current_section = section_name
+                        break
+                
+                if current_section:
+                    header_map = {}
+                    for i, col_name in enumerate(metric_cols):
+                        normalized_name = col_name.replace('%', 'pct_').replace('/', '_s')
+                        header_map[normalized_name] = i
+                continue
+
+            if not current_section or not header_map:
                 continue
             
             timestamp = ts_match.group(1)
-            parts = re.split(r'\s+', line.strip())
-
-            # --- 헤더 라인 식별 및 분석 ---
-            header_keywords = {'CPU', 'IFACE', 'kbmemfree', 'DEV', 'runq-sz'}
-            is_header = any(keyword in parts for keyword in header_keywords)
-            
-            if is_header:
-                header_map = {}
-                raw_header_parts = parts
-                
-                # 섹션 결정
-                if 'CPU' in raw_header_parts and any('%' in p for p in raw_header_parts): current_section = 'cpu'
-                elif 'IFACE' in raw_header_parts: current_section = 'net'
-                elif 'kbmemfree' in raw_header_parts: current_section = 'mem'
-                elif 'DEV' in raw_header_parts and 'tps' in raw_header_parts: current_section = 'disk'
-                elif 'runq-sz' in raw_header_parts: current_section = 'load'
-                else: current_section = None
-                
-                if current_section:
-                    for i, header in enumerate(raw_header_parts):
-                        normalized_header = header.replace('%', 'pct_').replace('/', '_s')
-                        header_map[normalized_header] = i
-                continue
-
-            # --- 데이터 라인 파싱 ---
-            if not current_section or not header_map:
-                continue
+            data_values_str = line[ts_match.end():].strip()
+            data_values = re.split(r'\s+', data_values_str)
 
             try:
                 entry = {'timestamp': timestamp}
                 for key, index in header_map.items():
-                    if index < len(parts):
-                        entry[key] = parts[index]
-                
-                # 섹션별 데이터 저장
+                    if index < len(data_values):
+                        entry[key] = data_values[index]
+
                 if current_section == 'cpu' and entry.get('CPU') == 'all':
                     performance_data['cpu'].append({
                         'timestamp': timestamp,
@@ -536,7 +554,7 @@ class SosreportParser:
                         'ldavg-15': float(entry.get('ldavg-15', '0').replace(',', '.'))
                     })
             except (ValueError, IndexError, KeyError) as e:
-                print(f"sar 데이터 라인 파싱 중 경미한 오류: {e} | 라인: '{line}'")
+                print(f"  -> sar 데이터 라인 파싱 경고: {e} | 라인: '{line}'")
                 continue
                 
         return performance_data
@@ -1186,6 +1204,8 @@ class AIAnalyzer:
             print(f"  -> sar 데이터에서 {len(network_by_iface)}개의 네트워크 인터페이스 발견: {', '.join(network_by_iface.keys())}")
             
             network_graphs_generated = False
+            inactive_up_interfaces = []
+
             for iface, data in network_by_iface.items():
                 state = interface_states.get(iface, 'UNKNOWN')
                 if state != 'UP':
@@ -1202,14 +1222,18 @@ class AIAnalyzer:
                     def get_flexible_net_data(d_list, key_patterns):
                         values = []
                         if not d_list: return []
+                        
+                        first_item_keys = d_list[0].keys()
                         actual_key = None
-                        first_item = d_list[0]
+                        
                         for pattern in key_patterns:
-                            if pattern in first_item:
-                                actual_key = pattern
+                            normalized_pattern = pattern.replace('/', '_s')
+                            if normalized_pattern in first_item_keys:
+                                actual_key = normalized_pattern
                                 break
                         
-                        if not actual_key: return [0.0] * len(d_list)
+                        if not actual_key: 
+                            return [0.0] * len(d_list)
 
                         for d in d_list:
                             try:
@@ -1219,16 +1243,19 @@ class AIAnalyzer:
                                 values.append(0.0)
                         return values
 
-                    rxpck = get_flexible_net_data(data, ['rxpck_s', 'rxpck/s'])
-                    txpck = get_flexible_net_data(data, ['txpck_s', 'txpck/s'])
-                    rxkB = get_flexible_net_data(data, ['rxkB_s', 'rxkB/s'])
-                    txkB = get_flexible_net_data(data, ['txkB_s', 'txkB/s'])
-                    rxcmp = get_flexible_net_data(data, ['rxcmp_s', 'rxcmp/s'])
-                    txcmp = get_flexible_net_data(data, ['txcmp_s', 'txcmp/s'])
-                    rxmcst = get_flexible_net_data(data, ['rxmcst_s', 'rxmcst/s'])
+                    rxpck = get_flexible_net_data(data, ['rxpck/s', 'rxpck_s'])
+                    txpck = get_flexible_net_data(data, ['txpck/s', 'txpck_s'])
+                    rxkB = get_flexible_net_data(data, ['rxkB/s', 'rxkB_s'])
+                    txkB = get_flexible_net_data(data, ['txkB/s', 'txkB_s'])
+                    rxcmp = get_flexible_net_data(data, ['rxcmp/s', 'rxcmp_s'])
+                    txcmp = get_flexible_net_data(data, ['txcmp/s', 'txcmp_s'])
+                    rxmcst = get_flexible_net_data(data, ['rxmcst/s', 'rxmcst_s'])
 
-                    if all(v == 0.0 for v in rxpck + txpck + rxkB + txkB):
-                        print(f"  - ⚠️ {iface} 인터페이스의 sar 데이터가 모두 0입니다. 그래프가 비어 보일 수 있습니다.")
+                    total_traffic = sum(rxpck) + sum(txpck) + sum(rxkB) + sum(txkB)
+                    if total_traffic == 0.0:
+                        print(f"  - {iface} 인터페이스는 트래픽이 없어 그래프 생성을 건너뜁니다.")
+                        inactive_up_interfaces.append(iface)
+                        continue
 
                     fig, ax1 = plt.subplots(figsize=(12, 6))
                     ax2 = ax1.twinx()
@@ -1267,15 +1294,11 @@ class AIAnalyzer:
                     traceback.print_exc()
 
             if not network_graphs_generated:
-                up_interfaces_with_data = 0
-                for iface, data in network_by_iface.items():
-                    if interface_states.get(iface, 'UNKNOWN') == 'UP' and len(data) >= 2:
-                        up_interfaces_with_data += 1
-                
-                if up_interfaces_with_data == 0:
-                    graphs['network_graph_reason'] = "데이터 부족: 'State: UP' 상태이면서 유효한 성능 데이터를 가진 네트워크 인터페이스가 없습니다."
+                if inactive_up_interfaces:
+                    reason = f"UP 상태인 인터페이스({', '.join(inactive_up_interfaces)})가 있지만, 기록된 트래픽이 없어 그래프를 생성하지 않았습니다."
+                    graphs['network_graph_reason'] = reason
                 else:
-                    graphs['network_graph_reason'] = "데이터 부족: sar 데이터에 유효한 네트워크 성능 정보가 없어 그래프를 생성할 수 없습니다."
+                    graphs['network_graph_reason'] = "데이터 부족: 'State: UP' 상태이면서 유효한 성능 데이터를 가진 네트워크 인터페이스가 없습니다."
         else:
              graphs['network_graph_reason'] = "데이터 없음: sar 파일에서 관련 통계 정보를 찾을 수 없습니다."
         
