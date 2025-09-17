@@ -984,81 +984,33 @@ class AIAnalyzer:
             print(f"시스템에 영향을 주는 CVE를 총 {len(system_relevant_cves)}개 발견했습니다.")
             system_relevant_cves.sort(key=lambda x: (severity_order.get(x.get('severity', 'low').lower(), -1), x.get('public_date')), reverse=True)
             
-            top_cves_for_analysis = system_relevant_cves[:40]
-            print(f"그 중 {len(top_cves_for_analysis)}개를 1차 분석 대상으로 선별했습니다. (최대 40개)")
+            # --- CVE 선정 로직: 패키지당 1개, 최대 5개 ---
+            final_report_cves = []
+            selected_packages = set()
+            MAX_CVES_TO_REPORT = 20
 
-            if not top_cves_for_analysis:
+            for cve in system_relevant_cves:
+                if len(final_report_cves) >= MAX_CVES_TO_REPORT:
+                    break
+
+                pkg_full_name = cve.get('matched_package', '')
+                if not pkg_full_name: continue
+                
+                pkg_name_match = re.match(r'^([a-zA-Z0-9_.+-]+)-', pkg_full_name)
+                if not pkg_name_match: continue
+                
+                pkg_base_name = pkg_name_match.group(1)
+
+                if pkg_base_name not in selected_packages:
+                    final_report_cves.append(cve)
+                    selected_packages.add(pkg_base_name)
+
+            print(f"시스템 관련 CVE {len(final_report_cves)}개를 1차 선별했습니다. (패키지당 1개, 최대 {MAX_CVES_TO_REPORT}개)")
+
+            if not final_report_cves:
                 reason = "시스템에 설치된 패키지에 직접적인 영향을 주는 최신 보안 뉴스가 없습니다."
                 print(reason)
                 return [{"reason": reason}]
-            
-            cve_identifiers = [cve['CVE'] for cve in top_cves_for_analysis]
-            packages_str = "\n- ".join(list(installed_packages_full)[:50]) + ("..." if len(installed_packages_full) > 50 else "")
-
-            selection_prompt = f"""
-[시스템 안내]
-당신은 Red Hat Enterprise Linux(RHEL)를 전문으로 다루는 '시니어 보안 위협 분석가'입니다.
-당신의 임무는 주어진 RHEL 관련 보안 취약점 목록을 분석하여, 특정 시스템에 가장 시급하고 중요한 CVE를 **최대 10개**까지 선정하는 것입니다.
-선별 과정에서 필요하다면 **Web Search**를 활성화하여 최신 정보를 검색하고 판단에 반영하십시오.
-
-[분석 대상 시스템 정보]
-- **커널 버전:** {kernel_version}
-- **설치된 패키지 목록 (일부):**
-- {packages_str}
-
-[선별 기준]
-1.  **최신 동향 및 실제 위협(Web Search 활용):** Web Search를 통해 최신 보안 동향, 공개된 공격 코드(Exploit) 유무, 실제 공격(In-the-wild) 사례 등을 파악하여 위험도가 높다고 판단되는 CVE를 최우선으로 고려해야 합니다.
-2.  **시스템 패키지 연관성:** 주어진 목록의 모든 CVE는 이미 시스템에 설치된 패키지와 연관성이 확인된 상태입니다.
-3.  **영향받는 핵심 컴포넌트:** `kernel`, `glibc`, `openssl`, `openssh`, `systemd` 등 RHEL 시스템의 핵심 컴포넌트에 영향을 주는 취약점 severity가 (important, critical)을 우선적으로 다룹니다.
-
-[입력 데이터]
-분석 대상 CVE 목록 (시스템 관련성 확인됨): {', '.join(cve_identifiers)}
-
-[출력 지시]
-위 선별 기준을 종합적으로 적용하여 선정한 **최대 10개**의 CVE에 대한 정보를 아래 JSON 형식에 맞춰 출력하십시오.
-- `cve_id`: **반드시 [입력 데이터]에 존재하는 CVE ID 중에서만** 선택해야 합니다.
-- `selection_reason`: 왜 이 CVE를 선택했는지 선별 기준(특히 웹 검색을 통해 파악한 최신 동향 및 실제 위협)에 근거하여 **한국어로 명확하고 간결하게** 기술해야 합니다.
-- **중요**: 당신의 응답은 반드시 아래 JSON 형식의 객체여야 합니다. 어떠한 설명이나 추가 텍스트도 포함하지 마십시오.
-
-```json
-{{
-  "cve_selection": [
-    {{
-      "cve_id": "CVE-XXXX-XXXX",
-      "selection_reason": "이 CVE를 선별한 구체적인 이유 (예: 최근 공격 코드가 공개되었으며, 시스템의 OpenSSL 패키지에 직접적인 영향을 줌)"
-    }}
-  ]
-}}
-```
-"""
-            
-            selection_result = self.perform_ai_analysis(selection_prompt, is_news_request=True)
-            
-            final_report_cves = []
-            if isinstance(selection_result, dict) and 'cve_selection' in selection_result and selection_result['cve_selection']:
-                llm_log_path = self.output_dir / "llm_security_news.log"
-                selected_cves_from_llm = selection_result['cve_selection']
-                original_cves_map = {cve['CVE']: cve for cve in top_cves_for_analysis}
-                
-                with open(llm_log_path, 'a', encoding='utf-8') as f:
-                    f.write("\n\n--- CVE SELECTION & VALIDATION ---\n")
-                    for item in selected_cves_from_llm:
-                        cve_id = item.get('cve_id')
-                        reason = item.get('selection_reason', 'No reason provided.')
-                        
-                        if cve_id and cve_id in original_cves_map:
-                            log_entry = f"- [VALID] {cve_id}: {reason}\n"
-                            f.write(log_entry)
-                            print(f"📝 로그 기록 (유효): {cve_id} 선별 이유")
-                            final_report_cves.append(original_cves_map[cve_id])
-                        else:
-                            log_entry = f"- [INVALID/HALLUCINATED] ID: {cve_id}, Reason: {reason}\n"
-                            f.write(log_entry)
-                            print(f"⚠️ 경고: AI가 생성한 유효하지 않은 CVE ID({cve_id})를 무시합니다.")
-            
-            if not final_report_cves:
-                print("⚠️ LLM이 중요 CVE를 선정하지 못했습니다. 수동으로 상위 CVE를 선택합니다.")
-                final_report_cves = top_cves_for_analysis[:10]
 
             processing_data = [{"cve_id": cve['CVE'], "description": cve.get('bugzilla_description', '요약 정보 없음')} for cve in final_report_cves]
 
@@ -1793,7 +1745,7 @@ class AIAnalyzer:
                 </table>
             </div>
             <div class="section">
-                <h2>🛡️ 보안 뉴스 (가장 중요한 CVE 최대 10개) <span style="font-size: 0.7em; font-weight: normal;">(🔥 Critical, ⚠️ Important)</span></h2>
+                <h2>🛡️ 보안 뉴스 (가장 중요한 CVE 최대 5개) <span style="font-size: 0.7em; font-weight: normal;">(🔥 Critical, ⚠️ Important)</span></h2>
                 <table class="data-table security-table fixed-layout">
                     <thead><tr><th>CVE 식별자</th><th>심각도</th><th>생성일</th><th>위협 및 영향 요약</th></tr></thead>
                     <tbody>{create_security_news_rows(security_news)}</tbody>
