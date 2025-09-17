@@ -24,6 +24,8 @@ import html # HTML 이스케이프를 위해 추가
 import io
 import base64
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import tempfile
+import subprocess # chattr 명령어 실행을 위해 추가
 
 # --- 그래프 생성을 위한 라이브러리 ---
 # "pip install matplotlib" 명령어로 설치 필요
@@ -496,7 +498,7 @@ class SosreportParser:
             if is_header:
                 current_section = None
                 # 섹션 결정
-                if '%user' in metric_cols and '%system' in metric_cols:
+                if 'CPU' in metric_cols and ('%user' in metric_cols or '%usr' in metric_cols):
                     current_section = 'cpu'
                 elif 'IFACE' in metric_cols:
                     current_section = 'net'
@@ -510,6 +512,9 @@ class SosreportParser:
                 if current_section:
                     header_map = {}
                     for i, col_name in enumerate(metric_cols):
+                        # Normalize common variations like %usr -> %user
+                        if col_name == '%usr':
+                            col_name = '%user'
                         normalized_name = col_name.replace('%', 'pct_').replace('/', '_s')
                         header_map[normalized_name] = i
                 continue
@@ -534,7 +539,7 @@ class SosreportParser:
                         performance_data['cpu'].append({
                             'timestamp': timestamp,
                             'user': float(entry.get('pct_user', '0').replace(',', '.')),
-                            'system': float(entry.get('pct_sys', '0').replace(',', '.')),
+                            'system': float(entry.get('pct_system', entry.get('pct_sys', '0')).replace(',', '.')),
                             'iowait': float(entry.get('pct_iowait', '0').replace(',', '.')),
                             'idle': float(entry.get('pct_idle', '0').replace(',', '.'))
                         })
@@ -760,48 +765,64 @@ class AIAnalyzer:
 
     def perform_ai_analysis(self, prompt: str, is_news_request: bool = False) -> Any:
         print("AI 분석 시작...")
-        try:
-            payload = {
-                "model": self.model_name,
-                "messages": [
-                    {"role": "system", "content": "You are a helpful assistant designed to output JSON."},
-                    {"role": "user", "content": prompt}
-                ],
-                "max_tokens": 16384, 
-                "temperature": 0.1,
-            }
-            start_time = time.time()
-            print(f"LLM API 호출 중... ({self.completion_url})")
+        max_retries = 3
+        wait_time = 2  # Initial wait time in seconds
 
-            if is_news_request:
-                llm_log_path = self.output_dir / "llm_security_news.log"
-                with open(llm_log_path, 'a', encoding='utf-8') as f:
-                    f.write("\n\n--- NEW PROMPT FOR SECURITY NEWS ---\n")
-                    f.write(prompt)
-                    f.write("\n\n--- LLM RESPONSE ---\n")
-                print("\n--- LLM에게 보낸 보안 뉴스 프롬프트 ---")
-                print(prompt[:500] + "...")
-                print("-------------------------------------\n")
+        for attempt in range(max_retries):
+            try:
+                payload = {
+                    "model": self.model_name,
+                    "messages": [
+                        {"role": "system", "content": "You are a helpful assistant designed to output JSON."},
+                        {"role": "user", "content": prompt}
+                    ],
+                    "max_tokens": 16384, 
+                    "temperature": 0.1,
+                }
+                start_time = time.time()
+                print(f"LLM API 호출 중... (시도 {attempt + 1}/{max_retries})")
 
-            response = self.session.post(self.completion_url, json=payload, timeout=self.timeout)
-            print(f"API 응답 시간: {time.time() - start_time:.2f}초")
+                if is_news_request and attempt == 0:
+                    llm_log_path = self.output_dir / "llm_security_news.log"
+                    with open(llm_log_path, 'a', encoding='utf-8') as f:
+                        f.write("\n\n--- NEW PROMPT FOR SECURITY NEWS ---\n")
+                        f.write(prompt)
+                        f.write("\n\n--- LLM RESPONSE ---\n")
+                    print("\n--- LLM에게 보낸 보안 뉴스 프롬프트 ---")
+                    print(prompt[:500] + "...")
+                    print("-------------------------------------\n")
 
-            if response.status_code != 200:
-                raise ValueError(f"API 호출 실패: HTTP {response.status_code}, 내용: {response.text[:500]}")
-            
-            result = response.json()
-            if 'choices' not in result or not result['choices']:
-                raise ValueError(f"API 응답에 'choices' 키가 없거나 비어 있습니다. 응답: {result}")
+                response = self.session.post(self.completion_url, json=payload, timeout=self.timeout)
+                print(f"API 응답 시간: {time.time() - start_time:.2f}초")
 
-            ai_response = result['choices'][0]['message']['content']
-            
-            if is_news_request:
-                with open(llm_log_path, 'a', encoding='utf-8') as f:
-                    f.write(ai_response)
+                if response.status_code == 200:
+                    result = response.json()
+                    if 'choices' not in result or not result['choices']:
+                        raise ValueError(f"API 응답에 'choices' 키가 없거나 비어 있습니다. 응답: {result}")
+                    
+                    ai_response = result['choices'][0]['message']['content']
+                    if is_news_request:
+                        with open(llm_log_path, 'a', encoding='utf-8') as f:
+                            f.write(ai_response)
+                    return self._parse_ai_response_json_only(ai_response)
 
-            return self._parse_ai_response(ai_response)
-        except (requests.exceptions.RequestException, ValueError) as e:
-            raise Exception(f"AI 분석 중 오류 발생: {e}")
+                if 500 <= response.status_code < 600:
+                    error_message = f"API 서버 오류 (HTTP {response.status_code})"
+                    print(f"⚠️ {error_message}. {wait_time}초 후 재시도합니다.")
+                    time.sleep(wait_time)
+                    wait_time *= 2
+                    continue
+                
+                else:
+                    raise ValueError(f"API 호출 실패 (재시도 불가): HTTP {response.status_code}, 내용: {response.text[:500]}")
+
+            except (requests.exceptions.RequestException, ValueError) as e:
+                print(f"⚠️ AI 분석 중 오류 발생 (시도 {attempt + 1}/{max_retries}): {e}")
+                if attempt < max_retries - 1:
+                    time.sleep(wait_time)
+                    wait_time *= 2
+                else:
+                    raise Exception(f"AI 분석 중 최종 오류 발생: {e}")
 
     def create_analysis_prompt(self, sosreport_data: Dict[str, Any]) -> str:
         print("AI 분석 프롬프트 생성 중...")
@@ -821,7 +842,7 @@ class AIAnalyzer:
 
         data_str = json.dumps(data_to_send, indent=2, ensure_ascii=False)
 
-        prompt = f"""당신은 Red Hat Enterprise Linux 시스템 전문가입니다. 다음 sosreport 분석 데이터와 시스템 로그를 종합적으로 검토하고 전문적인 진단을 제공해주세요.
+        prompt = f"""당신은 Red Hat Enterprise Linux 시스템 전문가입니다. 다음 sosreport 분석 데이터와 시스템 로그를 종합적으로 검토하고 **한국어로** 전문적인 진단을 제공해주세요.
 
 ## 분석 데이터
 ```json
@@ -832,10 +853,13 @@ class AIAnalyzer:
 - **심각한 이슈(critical_issues) 판단 기준**: 로그 내용에 'panic', 'segfault', 'out of memory', 'hardware error', 'i/o error', 'call trace'와 같은 명백한 시스템 장애나 데이터 손상 가능성을 암시하는 키워드가 포함된 경우, **반드시 '심각한 이슈'로 분류**해야 합니다.
 - **경고(warnings) 판단 기준**: 당장 시스템 장애를 일으키지는 않지만, 잠재적인 문제로 발전할 수 있거나 주의가 필요한 로그(예: 'warning', 'failed' 등)는 '경고'로 분류합니다.
 
-## 분석 요청
-위 데이터와 **분석 가이드라인**을 바탕으로, 특히 **`recent_log_warnings_and_errors`에 포함된 시스템 로그 메시지를 주의 깊게 분석**하여 다음 JSON 형식에 맞춰 종합적인 시스템 분석을 제공해주세요.
-- 로그에서 발견된 구체적인 오류나 경고를 `critical_issues` 또는 `warnings` 항목에 반드시 반영해야 합니다.
-- `recommendations`의 각 항목을 작성할 때, 어떤 로그 메시지를 근거로 해당 권장사항을 만들었는지 `related_logs` 필드에 명시해야 합니다.
+## 분석 절차 (내부적으로만 수행)
+1.  **예비 분석**: 주어진 모든 데이터를 검토하고, 특히 `recent_log_warnings_and_errors` 목록에서 'panic', 'i/o error' 등 심각도를 나타내는 키워드를 식별하여 잠재적 이슈의 우선순위를 정합니다.
+2.  **JSON 초안 작성 (내부적)**: 1단계 분석을 바탕으로, `critical_issues`, `warnings`, `recommendations` 항목을 채운 JSON 구조의 초안을 마음속으로 구성합니다. 이때, 각 권장사항(`recommendations`)이 어떤 로그(`related_logs`)에 근거하는지 명확히 연결합니다.
+3.  **최종 JSON 검토 및 출력**: 2단계에서 구성한 초안을 최종적으로 검토하고, 빠진 내용이나 불일치는 없는지 확인한 후, 완전한 JSON 객체 **하나만을** 출력합니다.
+
+## 최종 출력 형식
+**모든 `critical_issues`, `warnings`, `recommendations`, `summary` 필드의 내용은 반드시 자연스러운 한국어로 작성해주세요.**
 
 ```json
 {{
@@ -856,11 +880,11 @@ class AIAnalyzer:
 }}
 ```
 
-**중요**: 당신의 응답은 반드시 위 JSON 형식이어야 합니다. 다른 설명이나 텍스트 없이, `{{`로 시작해서 `}}`로 끝나는 순수한 JSON 객체만 출력해야 합니다. `related_logs` 필드는 근거가 된 로그가 없을 경우 빈 배열 `[]`로 출력해주세요.
+**중요**: 위 분석 절차에 따라 분석을 완료하고, 당신의 전체 응답은 오직 위 형식의 단일 JSON 객체여야 합니다. `related_logs` 필드는 근거가 된 로그가 없을 경우 빈 배열 `[]`로 출력해주세요. JSON 객체 앞뒤로 어떠한 설명, 요약, 추론 과정도 포함하지 마십시오.
 """
         return prompt
 
-    def _parse_ai_response(self, ai_response: str) -> Any:
+    def _parse_ai_response_json_only(self, ai_response: str) -> Any:
         print("AI 응답 파싱 중...")
         
         if not ai_response or not ai_response.strip():
@@ -872,20 +896,13 @@ class AIAnalyzer:
 
         try:
             cleaned_response = re.sub(r'^```(json)?\s*|\s*```$', '', ai_response.strip())
-            start = cleaned_response.find('{')
-            end = cleaned_response.rfind('}')
-            
-            if start == -1 or end == -1 or end < start:
-                raise ValueError("응답에서 유효한 JSON 객체({{ ... }})를 찾을 수 없습니다.")
-            
-            json_str = cleaned_response[start:end+1]
-            return json.loads(json_str)
+            return json.loads(cleaned_response)
         except json.JSONDecodeError as e:
             error_message = f"AI 응답 JSON 파싱 실패: {e}.\n--- 원본 응답 ---\n{ai_response}\n----------------"
             print(error_message)
             raise ValueError(error_message)
-        except ValueError as e:
-            error_message = f"AI 응답 처리 중 오류 발생: {e}.\n--- 원본 응답 ---\n{ai_response}\n----------------"
+        except Exception as e:
+            error_message = f"AI 응답 처리 중 예측하지 못한 오류 발생: {e}.\n--- 원본 응답 ---\n{ai_response}\n----------------"
             print(error_message)
             raise ValueError(error_message)
 
@@ -906,7 +923,13 @@ class AIAnalyzer:
             print(f"분석 대상 시스템 커널 버전: {kernel_version}")
             print(f"분석 대상 시스템의 설치된 패키지 {len(installed_packages_full)}개를 DB화하여 참고합니다.")
 
-            api_url = "https://access.redhat.com/hydra/rest/securitydata/cve.json"
+            api_url_raw = "https://access.redhat.com/hydra/rest/securitydata/cve.json"
+            
+            match = re.search(r'https?://[^\s\)]+', api_url_raw)
+            if not match:
+                raise ValueError(f"Could not extract a valid URL from: {api_url_raw}")
+            api_url = match.group(0)
+
             print(f"Red Hat CVE API 호출: {api_url}")
             response = requests.get(api_url, timeout=120)
             if response.status_code != 200:
@@ -919,16 +942,22 @@ class AIAnalyzer:
             now = datetime.now()
             start_date = now - timedelta(days=365)
             
-            package_cve_map = {}
+            system_relevant_cves = []
+            added_cve_ids = set()
             severity_order = {"critical": 2, "important": 1, "moderate": 0, "low": -1}
 
             for cve in all_cves:
+                cve_id = cve.get('CVE')
                 public_date_str = cve.get('public_date')
-                if not public_date_str: continue
+
+                if not all([cve_id, public_date_str]) or cve_id in added_cve_ids:
+                    continue
                 
                 try:
-                    cve_date = datetime.fromisoformat(public_date_str.replace('Z', '+00:00')).replace(tzinfo=None)
-                except ValueError: continue
+                    cve_date_str_no_ms = public_date_str.split('.')[0].replace('Z', '')
+                    cve_date = datetime.strptime(cve_date_str_no_ms, '%Y-%m-%dT%H:%M:%S')
+                except ValueError:
+                    continue
                 
                 severity_value = cve.get('severity')
                 severity = severity_value.lower() if isinstance(severity_value, str) else 'low'
@@ -936,35 +965,40 @@ class AIAnalyzer:
                 if not (start_date <= cve_date <= now and severity in ["critical", "important"]):
                     continue
                 
-                cve_affected_packages = cve.get('affected_packages', [])
-                for pkg_str in cve_affected_packages:
+                is_relevant = False
+                matched_package_full_name = "N/A"
+                for pkg_str in cve.get('affected_packages', []):
                     pkg_name_match = re.match(r'^([a-zA-Z0-9_.+-]+)-', pkg_str)
                     if pkg_name_match:
                         pkg_name = pkg_name_match.group(1)
                         if pkg_name in installed_package_names_only:
-                            current_severity = severity_order.get(severity, -1)
-                            existing_cve = package_cve_map.get(pkg_name)
-                            
-                            if not existing_cve or current_severity > severity_order.get(existing_cve.get('severity', 'low').lower(), -1):
-                                cve['matched_package'] = installed_packages_map[pkg_name]
-                                package_cve_map[pkg_name] = cve
-            
-            system_relevant_cves = list(package_cve_map.values())
+                            is_relevant = True
+                            matched_package_full_name = installed_packages_map.get(pkg_name, "N/A")
+                            break
+                
+                if is_relevant:
+                    cve['matched_package'] = matched_package_full_name
+                    system_relevant_cves.append(cve)
+                    added_cve_ids.add(cve_id)
 
-            if not system_relevant_cves:
+            print(f"시스템에 영향을 주는 CVE를 총 {len(system_relevant_cves)}개 발견했습니다.")
+            system_relevant_cves.sort(key=lambda x: (severity_order.get(x.get('severity', 'low').lower(), -1), x.get('public_date')), reverse=True)
+            
+            top_cves_for_analysis = system_relevant_cves[:40]
+            print(f"그 중 {len(top_cves_for_analysis)}개를 1차 분석 대상으로 선별했습니다. (최대 40개)")
+
+            if not top_cves_for_analysis:
                 reason = "시스템에 설치된 패키지에 직접적인 영향을 주는 최신 보안 뉴스가 없습니다."
                 print(reason)
                 return [{"reason": reason}]
-
-            print(f"시스템 관련 CVE {len(system_relevant_cves)}개를 1차 선별했습니다. (패키지당 1개)")
             
-            cve_identifiers = [cve['CVE'] for cve in system_relevant_cves]
+            cve_identifiers = [cve['CVE'] for cve in top_cves_for_analysis]
             packages_str = "\n- ".join(list(installed_packages_full)[:50]) + ("..." if len(installed_packages_full) > 50 else "")
 
             selection_prompt = f"""
 [시스템 안내]
 당신은 Red Hat Enterprise Linux(RHEL)를 전문으로 다루는 '시니어 보안 위협 분석가'입니다.
-당신의 임무는 주어진 RHEL 관련 보안 취약점 목록을 분석하여, 특정 시스템에 가장 시급하고 중요한 CVE를 **최대 10개**까지 선정하고, 그 선별 이유를 명확히 기록하는 것입니다.
+당신의 임무는 주어진 RHEL 관련 보안 취약점 목록을 분석하여, 특정 시스템에 가장 시급하고 중요한 CVE를 **최대 10개**까지 선정하는 것입니다.
 선별 과정에서 필요하다면 **Web Search**를 활성화하여 최신 정보를 검색하고 판단에 반영하십시오.
 
 [분석 대상 시스템 정보]
@@ -981,9 +1015,10 @@ class AIAnalyzer:
 분석 대상 CVE 목록 (시스템 관련성 확인됨): {', '.join(cve_identifiers)}
 
 [출력 지시]
-위 선별 기준을 종합적으로 적용하여 선정한 **최대 10개**의 CVE에 대한 정보를 아래 JSON 형식에 맞춰 **오직 JSON 객체만** 출력하십시오.
+위 선별 기준을 종합적으로 적용하여 선정한 **최대 10개**의 CVE에 대한 정보를 아래 JSON 형식에 맞춰 출력하십시오.
 - `cve_id`: **반드시 [입력 데이터]에 존재하는 CVE ID 중에서만** 선택해야 합니다.
 - `selection_reason`: 왜 이 CVE를 선택했는지 선별 기준(특히 웹 검색을 통해 파악한 최신 동향 및 실제 위협)에 근거하여 **한국어로 명확하고 간결하게** 기술해야 합니다.
+- **중요**: 당신의 응답은 반드시 아래 JSON 형식의 객체여야 합니다. 어떠한 설명이나 추가 텍스트도 포함하지 마십시오.
 
 ```json
 {{
@@ -999,11 +1034,11 @@ class AIAnalyzer:
             
             selection_result = self.perform_ai_analysis(selection_prompt, is_news_request=True)
             
-            top_cves_data = []
+            final_report_cves = []
             if isinstance(selection_result, dict) and 'cve_selection' in selection_result and selection_result['cve_selection']:
                 llm_log_path = self.output_dir / "llm_security_news.log"
                 selected_cves_from_llm = selection_result['cve_selection']
-                original_cves_map = {cve['CVE']: cve for cve in system_relevant_cves}
+                original_cves_map = {cve['CVE']: cve for cve in top_cves_for_analysis}
                 
                 with open(llm_log_path, 'a', encoding='utf-8') as f:
                     f.write("\n\n--- CVE SELECTION & VALIDATION ---\n")
@@ -1015,28 +1050,17 @@ class AIAnalyzer:
                             log_entry = f"- [VALID] {cve_id}: {reason}\n"
                             f.write(log_entry)
                             print(f"📝 로그 기록 (유효): {cve_id} 선별 이유")
-                            top_cves_data.append(original_cves_map[cve_id])
+                            final_report_cves.append(original_cves_map[cve_id])
                         else:
                             log_entry = f"- [INVALID/HALLUCINATED] ID: {cve_id}, Reason: {reason}\n"
                             f.write(log_entry)
                             print(f"⚠️ 경고: AI가 생성한 유효하지 않은 CVE ID({cve_id})를 무시합니다.")
             
-            if not top_cves_data:
+            if not final_report_cves:
                 print("⚠️ LLM이 중요 CVE를 선정하지 못했습니다. 수동으로 상위 CVE를 선택합니다.")
-                top_cves_data = sorted(system_relevant_cves, key=lambda x: (severity_order.get(x.get('severity', 'low').lower(), -1), x.get('public_date')), reverse=True)[:10]
+                final_report_cves = top_cves_for_analysis[:10]
 
-            if len(top_cves_data) < 10:
-                print(f"AI가 {len(top_cves_data)}개의 CVE만 선정했습니다. 목록을 보충합니다.")
-                selected_cve_ids = {cve['CVE'] for cve in top_cves_data}
-                remaining_cves = [cve for cve in system_relevant_cves if cve['CVE'] not in selected_cve_ids]
-                
-                sorted_remaining = sorted(remaining_cves, key=lambda x: (severity_order.get(x.get('severity', 'low').lower(), -1), x.get('public_date')), reverse=True)
-                
-                needed = 10 - len(top_cves_data)
-                top_cves_data.extend(sorted_remaining[:needed])
-
-
-            processing_data = [{"cve_id": cve['CVE'], "description": cve.get('bugzilla_description', '요약 정보 없음')} for cve in top_cves_data]
+            processing_data = [{"cve_id": cve['CVE'], "description": cve.get('bugzilla_description', '요약 정보 없음')} for cve in final_report_cves]
 
             processing_prompt = f"""
 [시스템 안내]
@@ -1048,7 +1072,8 @@ class AIAnalyzer:
 ```
 
 [출력 지시]
-아래 JSON 형식에 맞춰, 각 CVE에 대한 알기 쉬운 요약 설명을 포함하여 **오직 JSON 객체만** 출력하십시오. 단순 번역이 아닌, 위협의 본질과 잠재적 영향을 명확히 전달해야 합니다.
+아래 JSON 형식에 맞춰, 각 CVE에 대한 알기 쉬운 요약 설명을 포함하여 출력하십시오.
+**중요**: 당신의 응답은 반드시 아래 JSON 형식의 객체여야 합니다. 어떠한 설명이나 추가 텍스트도 포함하지 마십시오.
 
 ```json
 {{
@@ -1064,28 +1089,29 @@ class AIAnalyzer:
 
             processed_result = self.perform_ai_analysis(processing_prompt, is_news_request=True)
 
-            final_cves = []
+            final_cves_with_translation = []
             if isinstance(processed_result, dict) and 'processed_cves' in processed_result:
                 processed_map = {item['cve_id']: item for item in processed_result['processed_cves']}
-                for cve_data in top_cves_data:
+                for cve_data in final_report_cves:
                     cve_id = cve_data['CVE']
                     if cve_id in processed_map:
                         processed_info = processed_map[cve_id]
                         cve_date_str = cve_data.get('public_date', '')
                         if cve_date_str:
                             try:
-                                cve_data['public_date'] = datetime.fromisoformat(cve_date_str.replace('Z', '+00:00')).strftime('%y/%m/%d')
+                                cve_date_str_no_ms = cve_date_str.split('.')[0].replace('Z', '')
+                                cve_data['public_date'] = datetime.strptime(cve_date_str_no_ms, '%Y-%m-%dT%H:%M:%S').strftime('%y/%m/%d')
                             except ValueError: pass
                         
                         cve_data['bugzilla_description'] = processed_info.get('translated_description', cve_data['bugzilla_description'])
-                        final_cves.append(cve_data)
+                        final_cves_with_translation.append(cve_data)
                         print(f"✅ 보안 뉴스 처리 완료: {cve_id}")
             else:
                 print("⚠️ LLM의 번역 처리에 실패했습니다. 원본 데이터로 보고서를 생성합니다.")
-                final_cves = top_cves_data
+                final_cves_with_translation = final_report_cves
 
             print("✅ 보안 뉴스 조회 및 처리 완료.")
-            return final_cves
+            return final_cves_with_translation
 
         except Exception as e:
             print(f"❌ 보안 뉴스 조회 중 심각한 오류 발생: {e}")
@@ -1101,7 +1127,7 @@ class AIAnalyzer:
 
         print("성능 그래프 생성 중...")
         graphs = {}
-        plt.style.use('seaborn-v0_8-whitegrid')
+        plt.style.use('seaborn-whitegrid')
 
         perf_data = sos_data.get("performance_data", {})
         ip4_details = sos_data.get("ip4_details", [])
@@ -1261,7 +1287,7 @@ class AIAnalyzer:
                     ax1.plot(timestamps, rxpck, label='rxpck/s', color='tab:blue', linestyle='-')
                     ax1.plot(timestamps, txpck, label='txpck/s', color='tab:cyan', linestyle='-')
                     ax1.plot(timestamps, rxcmp, label='rxcmp/s', color='tab:green', linestyle=':')
-                    ax1.plot(timestamps, txcmp, label='txcmp/s', color='limegreen', linestyle=':')
+                    ax1.plot(timestamps, txcmp, label='limegreen', linestyle=':')
                     ax1.plot(timestamps, rxmcst, label='rxmcst/s', color='tab:gray', linestyle='--')
                     ax1.set_ylabel('Packets/s', color='tab:blue', fontsize=graph_style['label_fontsize'])
                     ax1.tick_params(axis='y', labelcolor='tab:blue')
@@ -1386,6 +1412,9 @@ class AIAnalyzer:
         ip4_details = sos_data.get('ip4_details', [])
         storage_info = sos_data.get('storage', [])
         security_news = sos_data.get('security_news', [])
+        network_details = sos_data.get('network_details', {})
+        process_stats = sos_data.get('process_stats', {})
+
 
         status_colors = {"정상": "#28a745", "주의": "#ffc107", "위험": "#dc3545"}
         status_color = status_colors.get(status, "#6c757d")
@@ -1396,23 +1425,54 @@ class AIAnalyzer:
                 return f"<tr><td style='text-align:center;'>{html.escape(empty_message)}</td></tr>"
             rows = ""
             for item in items:
-                rows += f"<tr><td>{html.escape(item)}</td></tr>"
+                rows += f"<tr><td>{html.escape(str(item))}</td></tr>"
             return rows
 
-        def create_table_rows(data_list, headers):
+        def create_storage_rows(storage_list: List[Dict[str, str]]) -> str:
             rows = ""
-            if not data_list:
-                return f"<tr><td colspan='{len(headers)}' style='text-align:center;'>데이터 없음</td></tr>"
+            if not storage_list:
+                return "<tr><td colspan='6' style='text-align:center;'>데이터 없음</td></tr>"
             
-            if isinstance(data_list, list) and len(data_list) == 1 and 'reason' in data_list[0]:
-                reason_text = html.escape(data_list[0]['reason'])
-                return f"<tr><td colspan='{len(headers)}' style='text-align:center;'>{reason_text}</td></tr>"
+            for index, item in enumerate(storage_list):
+                bg_color_style = "background-color: #f8f9fa;" if index % 2 == 1 else ""
 
-            for item in data_list:
-                rows += "<tr>"
-                for header in headers:
-                    rows += f"<td>{html.escape(str(item.get(header, 'N/A')))}</td>"
-                rows += "</tr>"
+                # Main data row
+                rows += f"""
+                    <tr style="{bg_color_style}">
+                        <td style="border-bottom: none; padding-bottom: 2px;">{html.escape(item.get('filesystem', 'N/A'))}</td>
+                        <td style="border-bottom: none; padding-bottom: 2px;">{html.escape(item.get('size', 'N/A'))}</td>
+                        <td style="border-bottom: none; padding-bottom: 2px;">{html.escape(item.get('used', 'N/A'))}</td>
+                        <td style="border-bottom: none; padding-bottom: 2px;">{html.escape(item.get('avail', 'N/A'))}</td>
+                        <td style="border-bottom: none; padding-bottom: 2px;">{html.escape(item.get('use%', 'N/A'))}</td>
+                        <td style="border-bottom: none; padding-bottom: 2px;">{html.escape(item.get('mounted_on', 'N/A'))}</td>
+                    </tr>
+                """
+                
+                # Progress bar row
+                use_pct_str = item.get('use%', '0%').replace('%', '')
+                try:
+                    use_pct = int(use_pct_str)
+                    color = "#28a745"  # Green
+                    if use_pct >= 90:
+                        color = "#dc3545"  # Red
+                    elif use_pct >= 80:
+                        color = "#fd7e14"  # Orange
+                    
+                    rows += f"""
+                        <tr style="{bg_color_style}">
+                            <td colspan="6" style="padding: 2px 12px 12px 12px; border-top: none;">
+                                <div class="progress-bar-container">
+                                    <div class="progress-bar" style="width: {use_pct}%; background-color: {color};"></div>
+                                </div>
+                            </td>
+                        </tr>
+                    """
+                except (ValueError, TypeError):
+                     rows += f"""
+                        <tr style="{bg_color_style}">
+                            <td colspan="6" style="border-top: none;"></td>
+                        </tr>
+                     """
             return rows
 
         def create_security_news_rows(news_list):
@@ -1466,6 +1526,71 @@ class AIAnalyzer:
                     </tr>
                 """
             return rows
+        
+        def create_ethtool_rows(ethtool_data):
+            rows = ""
+            if not ethtool_data: return "<tr><td colspan='6' style='text-align:center;'>데이터 없음</td></tr>"
+            for iface, data in ethtool_data.items():
+                errors_html = "없음"
+                if 'errors' in data and data['errors']:
+                    errors_html = "<br>".join([f"{k}: {v}" for k, v in data['errors'].items()])
+                rows += f"""
+                <tr>
+                    <td>{html.escape(iface)}</td>
+                    <td>{html.escape(data.get('speed', 'N/A'))}</td>
+                    <td>{html.escape(data.get('link', 'N/A'))}</td>
+                    <td>{html.escape(data.get('driver', 'N/A'))}</td>
+                    <td>{html.escape(data.get('firmware', 'N/A'))}</td>
+                    <td>{errors_html}</td>
+                </tr>
+                """
+            return rows
+
+        def create_bonding_rows(bonding_data):
+            rows = ""
+            if not bonding_data: return "<tr><td colspan='3' style='text-align:center;'>데이터 없음</td></tr>"
+            for bond in bonding_data:
+                rows += f"""
+                <tr>
+                    <td>{html.escape(bond.get('device', 'N/A'))}</td>
+                    <td>{html.escape(bond.get('mode', 'N/A'))}</td>
+                    <td>{html.escape(', '.join(bond.get('slaves', [])))}</td>
+                </tr>
+                """
+            return rows
+
+        def create_netdev_rows(netdev_data):
+            rows = ""
+            if not netdev_data: return "<tr><td colspan='9' style='text-align:center;'>데이터 없음</td></tr>"
+            for dev in netdev_data:
+                rows += f"""
+                <tr>
+                    <td>{html.escape(dev.get('iface', 'N/A'))}</td>
+                    <td>{dev.get('rx_bytes', 0):,}</td>
+                    <td>{dev.get('rx_packets', 0):,}</td>
+                    <td style="color: red;">{dev.get('rx_errs', 0):,}</td>
+                    <td style="color: red;">{dev.get('rx_drop', 0):,}</td>
+                    <td>{dev.get('tx_bytes', 0):,}</td>
+                    <td>{dev.get('tx_packets', 0):,}</td>
+                    <td style="color: red;">{dev.get('tx_errs', 0):,}</td>
+                    <td style="color: red;">{dev.get('tx_drop', 0):,}</td>
+                </tr>
+                """
+            return rows
+
+        def create_process_rows(process_list, title):
+            rows = ""
+            if not process_list: return f"<tr><td colspan='4' style='text-align:center;'>{title} 없음</td></tr>"
+            for p in process_list:
+                rows += f"""
+                <tr>
+                    <td>{html.escape(str(p.get('pid', '')))}</td>
+                    <td>{html.escape(p.get('user', ''))}</td>
+                    <td>{html.escape(str(p.get('cpu%', '')))}%</td>
+                    <td>{html.escape(p.get('command', ''))}</td>
+                </tr>
+                """
+            return rows
 
         ip4_details_rows = ""
         if not ip4_details:
@@ -1505,7 +1630,6 @@ class AIAnalyzer:
                 has_any_graph = True
                 graph_html += f'<div class="graph-container"><h3>{title}</h3><img src="data:image/png;base64,{graphs[key]}" alt="{title} Graph"></div>'
 
-        # 네트워크 그래프를 위한 개선된 로직
         network_graph_keys = sorted([k for k in graphs.keys() if k.startswith('network_graph_')])
         if 'network_graph_reason' in graphs:
              graph_html += f'<div class="graph-container"><h3>Network Traffic</h3><p style="text-align:center; color: #888;">{html.escape(graphs["network_graph_reason"])}</p></div>'
@@ -1536,19 +1660,28 @@ class AIAnalyzer:
         .content {{ padding: 20px; }}
         .section {{ margin-bottom: 25px; }}
         .section h2 {{ font-size: 20px; border-left: 5px solid #007bff; padding-left: 10px; margin-bottom: 15px; color: #343a40; }}
+        .section h3 {{ font-size: 16px; color: #495057; margin-top: 20px; margin-bottom: 10px;}}
         .graph-container {{ margin-bottom: 20px; padding: 15px; border: 1px solid #e0e0e0; border-radius: 5px; background-color: #fafafa; }}
         .graph-container h3 {{ text-align: center; margin-top: 0; color: #333; }}
         .graph-container img {{ width: 100%; max-width: 900px; display: block; margin: auto; border-radius: 4px; }}
         .data-table {{ width: 100%; border-collapse: collapse; margin-bottom: 20px; font-size: 14px; }}
         .data-table th, .data-table td {{ border: 1px solid #dee2e6; padding: 12px; text-align: left; word-wrap: break-word; }}
         .data-table thead th {{ background-color: #f8f9fa; color: #495057; font-weight: 600; }}
-        .data-table tbody tr:nth-child(even) {{ background-color: #f8f9fa; }}
+        .fixed-layout {{ table-layout: fixed; }}
+        .summary-table th:nth-of-type(1) {{ width: 20%; }}
+        .network-table th:nth-of-type(1) {{ width: 15%; }} .network-table th:nth-of-type(2) {{ width: 10%; }} .network-table th:nth-of-type(3) {{ width: 20%; }} .network-table th:nth-of-type(4) {{ width: 8%; }} .network-table th:nth-of-type(5) {{ width: 10%; }}
+        .storage-table th:nth-of-type(1) {{ width: 30%; }}
+        .recommendations-table th:nth-of-type(1) {{ width: 10%; }} .recommendations-table th:nth-of-type(2) {{ width: 15%; }} .recommendations-table th:nth-of-type(3) {{ width: 35%; }}
+        .security-table th:nth-of-type(1) {{ width: 18%; }} .security-table th:nth-of-type(2) {{ width: 8%; }} .security-table th:nth-of-type(3) {{ width: 10%; }}
+        .security-table td:nth-of-type(2), .security-table td:nth-of-type(3) {{ text-align: center; }}
         .ai-status {{ font-size: 1.2em; font-weight: bold; color: {status_color}; }}
         footer {{ text-align: center; padding: 15px; font-size: 12px; color: #888; background-color: #f4f7f9; }}
         .tooltip {{ position: relative; display: inline-block; cursor: pointer; }}
         .tooltip .tooltiptext {{ visibility: hidden; width: 450px; background-color: #333; color: #fff; text-align: left; border-radius: 6px; padding: 10px; position: absolute; z-index: 1; bottom: 125%; left: 50%; margin-left: -225px; opacity: 0; transition: opacity 0.3s; font-size: 12px; white-space: pre-wrap; }}
         .tooltip:hover .tooltiptext {{ visibility: visible; opacity: 1; }}
         .log-icon {{ font-size: 14px; margin-left: 5px; color: #007bff; }}
+        .progress-bar-container {{ height: 10px; width: 100%; background-color: #e9ecef; border-radius: 5px; overflow: hidden; }}
+        .progress-bar {{ height: 100%; border-radius: 5px; transition: width 0.4s ease-in-out; }}
     </style>
 </head>
 <body>
@@ -1557,7 +1690,7 @@ class AIAnalyzer:
         <div class="content">
             <div class="section">
                 <h2>ℹ️ 시스템 요약</h2>
-                <table class="data-table">
+                <table class="data-table summary-table fixed-layout">
                     <tbody>
                         <tr><th>Hostname</th><td>{html.escape(system_info.get('hostname', 'N/A'))}</td></tr>
                         <tr><th>OS Version</th><td>{html.escape(system_info.get('os_version', 'N/A'))}</td></tr>
@@ -1574,16 +1707,58 @@ class AIAnalyzer:
             <div class="section">
                 <h2>🌐 네트워크 정보</h2>
                 <h3>IP4 상세 정보</h3>
-                <table class="data-table">
+                <table class="data-table network-table fixed-layout">
                     <thead><tr><th>Interface</th><th>Master IF</th><th>MAC Address</th><th>MTU</th><th>State</th><th>IPv4 Address</th></tr></thead>
                     <tbody>{ip4_details_rows}</tbody>
+                </table>
+                <h3>라우팅 테이블</h3>
+                <table class="data-table">
+                    <thead><tr><th>Destination</th><th>Gateway</th><th>Device</th><th>Source</th></tr></thead>
+                    <tbody>{ "".join(f"<tr><td>{html.escape(r.get('destination', ''))}</td><td>{html.escape(r.get('gateway', ''))}</td><td>{html.escape(r.get('device', ''))}</td><td>{html.escape(r.get('source', ''))}</td></tr>" for r in system_info.get('routing_table', [])) }</tbody>
+                </table>
+                <h3>ETHTOOL 상태</h3>
+                <table class="data-table">
+                    <thead><tr><th>Interface</th><th>Speed</th><th>Link Detected</th><th>Driver</th><th>Firmware Version</th><th>Errors</th></tr></thead>
+                    <tbody>{ create_ethtool_rows(network_details.get('ethtool', {})) }</tbody>
+                </table>
+                 <h3>NETDEV 통계</h3>
+                <table class="data-table">
+                    <thead><tr><th>Iface</th><th>RX Bytes</th><th>RX Pkts</th><th>RX Errs</th><th>RX Drop</th><th>TX Bytes</th><th>TX Pkts</th><th>TX Errs</th><th>TX Drop</th></tr></thead>
+                    <tbody>{ create_netdev_rows(network_details.get('netdev', [])) }</tbody>
+                </table>
+                <h3>소켓 통계</h3>
+                <table class="data-table">
+                    <tbody>{ create_list_table(network_details.get('sockstat', []), "데이터 없음") }</tbody>
+                </table>
+                <h3>네트워크 본딩</h3>
+                <table class="data-table">
+                    <thead><tr><th>Device</th><th>Mode</th><th>Slaves</th></tr></thead>
+                    <tbody>{ create_bonding_rows(network_details.get('bonding', [])) }</tbody>
+                </table>
+            </div>
+            <div class="section">
+                <h2>⚙️ 프로세스 및 리소스</h2>
+                <h3>리소스 사용 현황 (상위 5개 사용자)</h3>
+                <table class="data-table">
+                    <thead><tr><th>User</th><th>CPU%</th><th>MEM%</th><th>RSS</th></tr></thead>
+                    <tbody>{"".join(f"<tr><td>{html.escape(u.get('user', ''))}</td><td>{html.escape(u.get('cpu%', ''))}</td><td>{html.escape(u.get('mem%', ''))}</td><td>{html.escape(u.get('rss', ''))}</td></tr>" for u in process_stats.get('by_user', []))}</tbody>
+                </table>
+                <h3>Top 5 CPU 사용 프로세스</h3>
+                <table class="data-table">
+                     <thead><tr><th>PID</th><th>User</th><th>CPU%</th><th>Command</th></tr></thead>
+                    <tbody>{create_process_rows(process_stats.get('top_cpu', []), "CPU 사용량 높은 프로세스")}</tbody>
+                </table>
+                 <h3>Top 5 메모리 사용 프로세스</h3>
+                <table class="data-table">
+                    <thead><tr><th>PID</th><th>User</th><th>MEM%</th><th>Command</th></tr></thead>
+                    <tbody>{create_process_rows(process_stats.get('top_mem', []), "메모리 사용량 높은 프로세스")}</tbody>
                 </table>
             </div>
             <div class="section">
                 <h2>💾 스토리지 및 파일 시스템</h2>
-                <table class="data-table">
+                <table class="data-table storage-table fixed-layout">
                     <thead><tr><th>Filesystem</th><th>Size</th><th>Used</th><th>Avail</th><th>Use%</th><th>Mounted on</th></tr></thead>
-                    <tbody>{create_table_rows(storage_info, ['filesystem', 'size', 'used', 'avail', 'use%', 'mounted_on'])}</tbody>
+                    <tbody>{create_storage_rows(storage_info)}</tbody>
                 </table>
             </div>
             <div class="section">
@@ -1602,14 +1777,14 @@ class AIAnalyzer:
             </div>
             <div class="section">
                 <h2>💡 AI 분석: 권장사항 ({len(recommendations)}개)</h2>
-                <table class="data-table">
+                <table class="data-table recommendations-table fixed-layout">
                     <thead><tr><th>우선순위</th><th>카테고리</th><th>문제점 💬</th><th>해결 방안</th></tr></thead>
                     <tbody>{create_recommendation_rows(recommendations)}</tbody>
                 </table>
             </div>
             <div class="section">
                 <h2>🤖 AI 종합 분석</h2>
-                <table class="data-table">
+                <table class="data-table summary-table fixed-layout">
                     <tbody>
                         <tr><th>종합 상태</th><td><span class="ai-status">{status}</span></td></tr>
                         <tr><th>건강도 점수</th><td>{score}/100</td></tr>
@@ -1619,7 +1794,7 @@ class AIAnalyzer:
             </div>
             <div class="section">
                 <h2>🛡️ 보안 뉴스 (가장 중요한 CVE 최대 10개) <span style="font-size: 0.7em; font-weight: normal;">(🔥 Critical, ⚠️ Important)</span></h2>
-                <table class="data-table">
+                <table class="data-table security-table fixed-layout">
                     <thead><tr><th>CVE 식별자</th><th>심각도</th><th>생성일</th><th>위협 및 영향 요약</th></tr></thead>
                     <tbody>{create_security_news_rows(security_news)}</tbody>
                 </table>
@@ -1643,25 +1818,40 @@ def win_safe_filter(member, path):
     return member
 
 def decompress_sosreport(archive_path: str, extract_dir: str) -> str:
+    """
+    sosreport 압축 파일을 해제합니다.
+    Linux 환경에서는 시스템 'tar' 명령어를 '--no-same-owner' 옵션과 함께 사용하여
+    추출된 파일들이 현재 스크립트를 실행하는 사용자 소유가 되도록 합니다.
+    """
     print(f"압축 파일 해제 중: {archive_path}")
-    try:
-        with tarfile.open(archive_path, 'r:*') as tar:
-            if sys.platform == "win32":
-                tar.extractall(path=extract_dir, filter=win_safe_filter)
-            else:
-                tar.extractall(path=extract_dir)
-        print(f"✅ 압축 해제 완료: {extract_dir}")
-        return extract_dir
-    except tarfile.TarError as e:
-        raise Exception(f"압축 파일 해제 실패: {e}")
-
-def rmtree_onerror(func, path, exc_info):
-    if isinstance(exc_info[1], PermissionError):
+    
+    if sys.platform == "win32":
         try:
-            os.chmod(path, 0o777)
-            func(path)
-        except Exception as e:
-            print(f"onerror 핸들러에서도 파일 처리 실패: {path}, 오류: {e}")
+            with tarfile.open(archive_path, 'r:*') as tar:
+                tar.extractall(path=extract_dir, filter=win_safe_filter)
+            print(f"✅ 압축 해제 완료 (Windows 방식): {extract_dir}")
+            return extract_dir
+        except tarfile.TarError as e:
+            raise Exception(f"압축 파일 해제 실패: {e}")
+    
+    else:
+        if not shutil.which("tar"):
+            raise EnvironmentError("'tar' 명령어를 찾을 수 없습니다. 스크립트 실행에 필수적입니다.")
+        
+        command = ["tar", "--no-same-owner", "-xf", archive_path, "-C", extract_dir]
+        
+        try:
+            print(f"실행 명령어: {' '.join(command)}")
+            result = subprocess.run(command, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            print(f"✅ 압축 해제 완료 (Linux 방식): {extract_dir}")
+            return extract_dir
+        except subprocess.CalledProcessError as e:
+            error_message = f"""압축 파일 해제 실패: 'tar' 명령어 실행 중 오류 발생.
+  - Return Code: {e.returncode}
+  - STDOUT: {e.stdout.decode(errors='ignore') if e.stdout else ''}
+  - STDERR: {e.stderr.decode(errors='ignore') if e.stderr else ''}"""
+            raise Exception(error_message)
+
 
 def main():
     parser = argparse.ArgumentParser(description='sosreport 압축 파일 AI 분석 및 보고서 생성 도구', formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -1676,6 +1866,11 @@ def main():
     parser.add_argument('--test-only', action='store_true', help='LLM 연결 테스트만 수행 (모델 이름 필요)')
     
     args = parser.parse_args()
+    
+    if sys.platform != "win32" and os.geteuid() != 0:
+        print("⚠️ 경고: 이 스크립트는 'sudo' 또는 root 권한으로 실행하는 것을 권장합니다.", file=sys.stderr)
+        print("   만약 'sudo' 없이 실행하려면, 시스템에 'tar' 명령어가 설치되어 있어야 합니다.", file=sys.stderr)
+
     api_token = args.api_token or os.getenv('LLM_API_TOKEN')
     
     if not plt:
@@ -1711,9 +1906,11 @@ def main():
 
     os.makedirs(args.output, exist_ok=True)
     
-    temp_extract_dir = Path(args.output) / f"temp_{Path(args.sosreport_archive).stem}_{int(time.time())}"
-    
+    temp_extract_dir = None
     try:
+        temp_extract_dir = tempfile.mkdtemp(prefix=f"sos_{Path(args.sosreport_archive).stem}_")
+        print(f"시스템 임시 경로에 작업 디렉토리 생성: {temp_extract_dir}")
+        
         decompress_sosreport(args.sosreport_archive, str(temp_extract_dir))
         
         parser = SosreportParser(str(temp_extract_dir))
@@ -1756,14 +1953,14 @@ def main():
         traceback.print_exc()
         sys.exit(1)
     finally:
-        if os.path.exists(temp_extract_dir):
-            print(f"임시 디렉토리 정리: {temp_extract_dir}")
+        if temp_extract_dir and os.path.exists(temp_extract_dir):
+            print(f"임시 디렉토리 정리 시도: {temp_extract_dir}")
             try:
-                shutil.rmtree(temp_extract_dir, onerror=rmtree_onerror)
+                shutil.rmtree(temp_extract_dir)
                 print("✅ 임시 디렉토리 정리 완료.")
             except Exception as e:
-                print(f"❌ 임시 디렉토리 정리에 최종 실패했습니다: {e}. 수동으로 삭제해주세요: {temp_extract_dir}")
+                print(f"\n❌ 임시 디렉토리 자동 정리에 실패했습니다: {e}")
+                print("   sudo rm -rf {temp_extract_dir}\n")
 
 if __name__ == "__main__":
     main()
-
