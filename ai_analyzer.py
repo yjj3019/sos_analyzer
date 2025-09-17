@@ -907,7 +907,14 @@ class AIAnalyzer:
             raise ValueError(error_message)
 
     def fetch_security_news(self, sos_data: Dict[str, Any]) -> List[Dict[str, str]]:
-        print("최신 RHEL 보안 뉴스 조회 및 분석 시작...")
+        """
+        ### 변경사항 ###
+        LLM을 활용한 2단계 CVE 분석 및 선정 로직을 도입했습니다.
+        1. 1단계: 최대 40개의 후보 CVE를 '패키지당 1개' 원칙으로 광범위하게 수집합니다.
+        2. 2단계: 수집된 후보군을 시스템 정보와 함께 LLM에 보내 '긴급도'를 분석하고, 가장 시급한 CVE 최대 10개를 최종 선정합니다.
+        3. 3단계: 선정된 10개의 CVE에 대해서만 사용자 친화적인 설명 번역을 요청합니다.
+        """
+        print("최신 RHEL 보안 뉴스 조회 및 분석 시작 (고도화된 2단계 프로세스)...")
         
         installed_packages_full = sos_data.get("installed_packages", [])
         if not installed_packages_full:
@@ -918,13 +925,13 @@ class AIAnalyzer:
         try:
             installed_packages_map = {re.sub(r'-[\d.:].*', '', pkg): pkg for pkg in installed_packages_full}
             installed_package_names_only = set(installed_packages_map.keys())
-            kernel_version = sos_data.get("system_info", {}).get("kernel", "N/A")
+            system_info = sos_data.get("system_info", {})
+            os_version = system_info.get("os_version", "N/A")
+            kernel_version = system_info.get("kernel", "N/A")
 
-            print(f"분석 대상 시스템 커널 버전: {kernel_version}")
-            print(f"분석 대상 시스템의 설치된 패키지 {len(installed_packages_full)}개를 DB화하여 참고합니다.")
+            print(f"분석 대상 시스템: {os_version} (Kernel: {kernel_version})")
 
             api_url_raw = "https://access.redhat.com/hydra/rest/securitydata/cve.json"
-            
             match = re.search(r'https?://[^\s\)]+', api_url_raw)
             if not match:
                 raise ValueError(f"Could not extract a valid URL from: {api_url_raw}")
@@ -939,8 +946,9 @@ class AIAnalyzer:
             all_cves = response.json()
             print(f"총 {len(all_cves)}개의 CVE 데이터를 Red Hat에서 가져왔습니다.")
             
+            # --- 1단계: 후보 CVE 광범위하게 수집 ---
             now = datetime.now()
-            start_date = now - timedelta(days=365)
+            start_date = now - timedelta(days=365) # 최근 1년 데이터 필터
             
             system_relevant_cves = []
             added_cve_ids = set()
@@ -962,6 +970,7 @@ class AIAnalyzer:
                 severity_value = cve.get('severity')
                 severity = severity_value.lower() if isinstance(severity_value, str) else 'low'
 
+                # 심각도 'Critical', 'Important' 필터
                 if not (start_date <= cve_date <= now and severity in ["critical", "important"]):
                     continue
                 
@@ -984,13 +993,13 @@ class AIAnalyzer:
             print(f"시스템에 영향을 주는 CVE를 총 {len(system_relevant_cves)}개 발견했습니다.")
             system_relevant_cves.sort(key=lambda x: (severity_order.get(x.get('severity', 'low').lower(), -1), x.get('public_date')), reverse=True)
             
-            # --- CVE 선정 로직: 패키지당 1개, 최대 5개 ---
-            final_report_cves = []
+            # --- 1단계 선정 로직: 패키지당 1개, 최대 40개 ---
+            initial_candidate_cves = []
             selected_packages = set()
-            MAX_CVES_TO_REPORT = 20
+            MAX_INITIAL_CVES = 40 # ### 변경: 최대 후보군 40개로 상향 ###
 
             for cve in system_relevant_cves:
-                if len(final_report_cves) >= MAX_CVES_TO_REPORT:
+                if len(initial_candidate_cves) >= MAX_INITIAL_CVES:
                     break
 
                 pkg_full_name = cve.get('matched_package', '')
@@ -1002,20 +1011,90 @@ class AIAnalyzer:
                 pkg_base_name = pkg_name_match.group(1)
 
                 if pkg_base_name not in selected_packages:
-                    final_report_cves.append(cve)
+                    initial_candidate_cves.append(cve)
                     selected_packages.add(pkg_base_name)
 
-            print(f"시스템 관련 CVE {len(final_report_cves)}개를 1차 선별했습니다. (패키지당 1개, 최대 {MAX_CVES_TO_REPORT}개)")
+            print(f"1단계 분석: 시스템 관련 CVE 후보군 {len(initial_candidate_cves)}개를 선별했습니다. (패키지당 1개, 최대 {MAX_INITIAL_CVES}개)")
 
-            if not final_report_cves:
+            if not initial_candidate_cves:
                 reason = "시스템에 설치된 패키지에 직접적인 영향을 주는 최신 보안 뉴스가 없습니다."
                 print(reason)
                 return [{"reason": reason}]
 
+            # --- 2단계: LLM을 통한 긴급도 분석 및 최종 10개 선정 ---
+            MAX_FINAL_CVES = 10
+            cves_for_ranking = []
+            for cve in initial_candidate_cves:
+                cves_for_ranking.append({
+                    "cve_id": cve.get('CVE'),
+                    "severity": cve.get('severity'),
+                    "cvss3_score": cve.get('cvss3_score'),
+                    "description": cve.get('bugzilla_description', '요약 정보 없음'),
+                    "matched_package": cve.get('matched_package')
+                })
+
+            ranking_prompt = f"""
+[시스템 역할]
+당신은 Red Hat Enterprise Linux(RHEL) 시스템의 보안을 책임지는 최고 수준의 사이버 보안 분석가입니다.
+
+[분석 대상 시스템 정보]
+- OS 버전: {os_version}
+- 커널 버전: {kernel_version}
+
+[임무]
+아래에 제공된 CVE 후보 목록을 분석하여, 주어진 시스템 환경에서 가장 시급하게 조치해야 할 **최대 {MAX_FINAL_CVES}개의 CVE를 선정**하십시오.
+
+[평가 기준]
+단순히 CVSS 점수나 심각도 등급만으로 판단하지 마십시오. 다음 기준을 종합적으로 고려하여 "실제적인 위협"과 "긴급성"을 평가해야 합니다.
+1.  **공격 벡터(Attack Vector):** 원격(Remote)에서 인증 없이 공격 가능한 취약점을 최우선으로 고려합니다.
+2.  **공격 복잡도(Attack Complexity):** 공격이 쉽고 간단할수록 긴급도가 높습니다.
+3.  **필요 권한(Privileges Required):** 공격에 특별한 권한이 필요 없을수록 위험합니다.
+4.  **영향(Impact):** 시스템 전체를 장악할 수 있는 '코드 실행(Code Execution)'이나 '권한 상승(Privilege Escalation)'으로 이어지는 취약점의 우선순위를 높게 평가합니다.
+5.  **패키지 중요도:** `kernel`, `glibc`, `openssh`, `systemd`와 같은 시스템 핵심 패키지의 취약점은 더 위험합니다.
+
+[입력 데이터: CVE 후보 목록]
+```json
+{json.dumps(cves_for_ranking, indent=2, ensure_ascii=False)}
+```
+
+[출력 형식]
+분석 결과를 바탕으로, 가장 긴급도가 높다고 판단되는 CVE의 ID를 **순서대로** 포함하는 JSON 객체 하나만을 출력하십시오. 객체에는 "most_urgent_cves" 라는 키만 포함되어야 하며, 값은 CVE ID 문자열의 배열이어야 합니다.
+
+```json
+{{
+  "most_urgent_cves": [
+    "CVE-XXXX-YYYY",
+    "CVE-AAAA-BBBB",
+    ...
+  ]
+}}
+```
+**중요**: 당신의 응답은 반드시 위의 JSON 형식이어야 합니다. 다른 설명이나 분석 과정을 절대 포함하지 마십시오.
+"""
+            
+            print(f"2단계 분석: LLM에게 {len(initial_candidate_cves)}개 CVE의 긴급도 분석 및 상위 {MAX_FINAL_CVES}개 선정을 요청합니다.")
+            ranking_result = self.perform_ai_analysis(ranking_prompt, is_news_request=True)
+            
+            top_cve_ids = []
+            if isinstance(ranking_result, dict) and 'most_urgent_cves' in ranking_result:
+                top_cve_ids = ranking_result['most_urgent_cves']
+                print(f"✅ LLM이 선정한 긴급 CVE 목록 ({len(top_cve_ids)}개): {', '.join(top_cve_ids)}")
+            else:
+                print("⚠️ LLM의 긴급도 분석 응답 형식이 올바르지 않아, 심각도 순으로 상위 10개를 자동 선정합니다.")
+                top_cve_ids = [cve['CVE'] for cve in initial_candidate_cves[:MAX_FINAL_CVES]]
+
+            # LLM이 선정한 ID를 기반으로 최종 CVE 목록 필터링
+            initial_cves_map = {cve['CVE']: cve for cve in initial_candidate_cves}
+            final_report_cves = [initial_cves_map[cve_id] for cve_id in top_cve_ids if cve_id in initial_cves_map]
+
+            print(f"최종 리포트에 포함할 CVE {len(final_report_cves)}개를 선정했습니다.")
+            if not final_report_cves: return [{"reason": "LLM 분석 결과, 보고서에 포함할 만한 긴급 CVE가 없습니다."}]
+
+            # --- 3단계: 최종 선정된 CVE에 대한 설명 번역 ---
             processing_data = [{"cve_id": cve['CVE'], "description": cve.get('bugzilla_description', '요약 정보 없음')} for cve in final_report_cves]
 
-            processing_prompt = f"""
-[시스템 안내]
+            translation_prompt = f"""
+[시스템 역할]
 당신은 Red Hat Enterprise Linux(RHEL) 보안 전문가입니다. 당신의 임무는 주어진 각 CVE의 영문 기술 설명을 분석하여, 시스템 관리자가 쉽게 이해할 수 있도록 핵심 내용과 시스템에 미치는 영향을 중심으로 자연스러운 한국어로 요약 및 설명하는 것입니다.
 
 [입력 데이터]
@@ -1038,8 +1117,8 @@ class AIAnalyzer:
 }}
 ```
 """
-
-            processed_result = self.perform_ai_analysis(processing_prompt, is_news_request=True)
+            print("3단계 분석: 최종 선정된 CVE에 대한 설명 번역을 LLM에 요청합니다.")
+            processed_result = self.perform_ai_analysis(translation_prompt, is_news_request=True)
 
             final_cves_with_translation = []
             if isinstance(processed_result, dict) and 'processed_cves' in processed_result:
@@ -1597,6 +1676,7 @@ class AIAnalyzer:
             graph_html += "<p style='text-align:center;'>분석할 수 있는 성능 데이터가 부족하여 그래프를 생성할 수 없습니다.</p>"
         graph_html += '</div>'
         
+        # ### 변경: HTML 보고서의 보안 뉴스 섹션 제목을 새로운 프로세스에 맞게 수정
         html_template = f"""
 <!DOCTYPE html>
 <html lang="ko">
@@ -1745,7 +1825,7 @@ class AIAnalyzer:
                 </table>
             </div>
             <div class="section">
-                <h2>🛡️ 보안 뉴스 (가장 중요한 CVE 최대 5개) <span style="font-size: 0.7em; font-weight: normal;">(🔥 Critical, ⚠️ Important)</span></h2>
+                <h2>🛡️ AI 선정 긴급 보안 위협 (최대 {MAX_FINAL_CVES}개) <span style="font-size: 0.7em; font-weight: normal;">(🔥 Critical, ⚠️ Important)</span></h2>
                 <table class="data-table security-table fixed-layout">
                     <thead><tr><th>CVE 식별자</th><th>심각도</th><th>생성일</th><th>위협 및 영향 요약</th></tr></thead>
                     <tbody>{create_security_news_rows(security_news)}</tbody>
