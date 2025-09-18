@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-sosreport 압축 파일 AI 분석 및 보고서 생성 모듈
+sosreport 압축 파일 AI 분석 및 보고서 생성 모듈 (추적 분석 기능 강화 및 폰트 자동 설치)
 sosreport 압축 파일을 입력받아 압축 해제, 데이터 추출, AI 분석, HTML 보고서 생성을 한 번에 수행합니다.
 
 사용법:
     # 기본 사용법 (sosreport 압축 파일을 입력)
-    python3 sos_analyzer.py sosreport-archive.tar.xz --llm-url <URL> --model <MODEL> --api-token <TOKEN>
+    python3 ai_analyzer.py sosreport-archive.tar.xz --llm-url <URL> --model <MODEL> --api-token <TOKEN>
 """
 
 import os
@@ -17,7 +17,7 @@ import time
 import re
 import tarfile
 import shutil
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date # 'date' 추가
 from pathlib import Path
 from typing import Dict, Any, Optional, List
 import html # HTML 이스케이프를 위해 추가
@@ -26,6 +26,7 @@ import base64
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import tempfile
 import subprocess # chattr 명령어 실행을 위해 추가
+import urllib.request # [폰트 해결] 폰트 다운로드를 위해 추가
 
 # --- 그래프 생성을 위한 라이브러리 ---
 # "pip install matplotlib" 명령어로 설치 필요
@@ -93,6 +94,8 @@ class SosreportParser:
 
         self.report_day_str = self.report_date.strftime('%d')
         self.report_full_date_str = self.report_date.strftime('%Y%m%d')
+        # [추적 분석] dmesg 내용을 멤버 변수로 캐싱
+        self.dmesg_content = self._read_file(['dmesg', 'sos_commands/kernel/dmesg'])
 
 
     def _read_file(self, possible_paths: List[str], default: str = 'N/A') -> str:
@@ -654,59 +657,137 @@ class SosreportParser:
                 
         return performance_data
 
+    def _find_sar_data_around_time(self, sar_section_data, target_dt, window_minutes=2):
+        """[추적 분석] 특정 시간 주변의 sar 데이터를 찾습니다. 원본 데이터를 수정하지 않습니다."""
+        if not sar_section_data:
+            return None
+        
+        closest_entry = None
+        min_delta = timedelta.max
+        
+        for entry in sar_section_data:
+            try:
+                # datetime 객체를 매번 생성하여 비교하고 원본 entry는 수정하지 않음
+                ts_str = entry['timestamp']
+                if 'PM' in ts_str or 'AM' in ts_str:
+                    dt = datetime.strptime(ts_str, '%I:%M:%S %p')
+                else:
+                    dt = datetime.strptime(ts_str, '%H:%M:%S')
+                
+                entry_dt = self.report_date.replace(hour=dt.hour, minute=dt.minute, second=dt.second)
+                
+                delta = abs(entry_dt - target_dt)
+                if delta < min_delta:
+                    min_delta = delta
+                    closest_entry = entry
 
-    def _parse_log_messages(self) -> List[str]:
+            except (ValueError, KeyError):
+                continue # 파싱 실패 시 건너뜀
+        
+        # window_minutes 내에 있는 경우에만 반환
+        if closest_entry and min_delta <= timedelta(minutes=window_minutes):
+            return closest_entry.copy() # 원본 수정을 막기 위해 복사본 반환
+        return None
+
+    def _analyze_and_trace_logs(self, performance_data: Dict) -> List[Dict[str, Any]]:
+        """[추적 분석] 로그 메시지를 분석하고, 중요한 이벤트에 대해 상관관계 추적을 수행합니다."""
         log_content = self._read_file(['var/log/messages', 'var/log/syslog'])
         if log_content == 'N/A' or not log_content.strip():
             print("⚠️ 'var/log/messages' 파일을 찾을 수 없거나 내용이 비어 있습니다.")
             return []
 
-        keywords = ['error', 'failed', 'critical', 'panic', 'segfault', 'out of memory', 'i/o error', 'hardware error', 'nmi', 'call trace']
-        warning_keyword = 'warning'
-        unique_logs = {}
-        log_prefix_re = re.compile(r'^[A-Za-z]{3}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2}\s+[\w.-]+\s+[^:]+:\s+')
+        print("로그 메시지 추적 분석 시작...")
+        traced_events = []
         
-        lines = log_content.split('\n')
-        print(f"총 {len(lines)}줄의 로그를 분석하여 핵심 메시지를 추출합니다...")
+        # 추적할 이벤트 패턴 정의
+        trace_patterns = {
+            'io_error': re.compile(r'i/o error, dev (\w+),'),
+            'oom_killer': re.compile(r'Out of memory: Kill process'),
+            'segfault': re.compile(r'segfault at .* ip .* sp .* error \d+ in (\S+)'),
+            'call_trace': re.compile(r'Call Trace:'),
+            'hardware_error': re.compile(r'Hardware Error|MCE'),
+        }
 
+        lines = log_content.split('\n')
         for line in lines:
             line_lower = line.lower()
-            if not any(keyword in line_lower for keyword in keywords) and warning_keyword not in line_lower:
+            
+            # 1. 로그에서 시간과 메시지 파싱
+            timestamp_match = re.match(r'^([A-Za-z]{3}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2})', line)
+            if not timestamp_match:
                 continue
+            
+            try:
+                # strptime은 연도를 필요로 하므로, report_date에서 가져옴
+                log_dt = datetime.strptime(f"{self.report_date.year} {timestamp_match.group(1)}", '%Y %b %d %H:%M:%S')
+            except ValueError:
+                continue # 파싱 실패 시 건너뜀
 
-            core_message = log_prefix_re.sub('', line) or line
-            normalized_message = re.sub(r'\b(sda|sdb|sdc|nvme0n1)\d*\b', 'sdX', core_message)
-            normalized_message = re.sub(r'\b\d{4,}\b', 'N', normalized_message)
-            normalized_message = re.sub(r'0x[0-9a-fA-F]+', '0xADDR', normalized_message)
-            normalized_message = re.sub(r'\[\s*\d+\.\d+\]', '', normalized_message).strip()
+            context = {}
+            event_type = "Unknown"
 
-            if not normalized_message: continue
+            # 2. 패턴 매칭 및 추적 분석 수행
+            if 'i/o error' in line_lower:
+                event_type = "I/O Error"
+                match = trace_patterns['io_error'].search(line)
+                device = match.group(1) if match else "unknown device"
+                
+                # sar 디스크 데이터 추적
+                disk_sar = self._find_sar_data_around_time(performance_data.get('disk', []), log_dt)
+                if disk_sar:
+                    context['sar_disk_context'] = {k: v for k, v in disk_sar.items() if k != 'timestamp'}
+                
+                # dmesg에서 관련 에러 추적
+                dmesg_context = [dmesg_line for dmesg_line in self.dmesg_content.split('\n')[-200:] if device in dmesg_line]
+                if dmesg_context:
+                    context['dmesg_context'] = dmesg_context[:5] # 최대 5줄
 
-            if normalized_message not in unique_logs:
-                unique_logs[normalized_message] = {'original_line': line, 'count': 0}
-            unique_logs[normalized_message]['count'] += 1
+            elif 'out of memory' in line_lower:
+                event_type = "Out of Memory"
+                # sar 메모리 데이터 추적
+                mem_sar = self._find_sar_data_around_time(performance_data.get('memory', []), log_dt)
+                if mem_sar:
+                    context['sar_memory_context'] = {k: v for k, v in mem_sar.items() if k != 'timestamp'}
 
-        if not unique_logs:
-            print("✅ 'var/log/messages'에서 심각한 오류나 경고가 발견되지 않았습니다.")
-            return []
+                # dmesg에서 OOM killer 로그 전문 추적
+                oom_dmesg = [d_line for d_line in self.dmesg_content.split('\n') if 'Out of memory: Kill process' in d_line or 'killed process' in d_line]
+                if oom_dmesg:
+                    context['dmesg_oom_details'] = oom_dmesg[-10:] # 마지막 10줄
 
-        sorted_logs = sorted(unique_logs.items(), key=lambda item: item[1]['count'], reverse=True)
-        formatted_results = []
-        for normalized, data in sorted_logs[:100]:
-            count = data['count']
-            original_line = data['original_line']
-            timestamp_match = re.match(r'^([A-Za-z]{3}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2})', original_line)
-            timestamp = timestamp_match.group(1) if timestamp_match else "Timestamp N/A"
-            formatted_results.append(f"[{count}회] {timestamp} - {normalized}")
-        
-        print(f"✅ 'var/log/messages'에서 {len(formatted_results)}개의 고유한 문제성 로그 그룹을 추출했습니다.")
-        return formatted_results
+            elif 'segfault' in line_lower:
+                event_type = "Segmentation Fault"
+                match = trace_patterns['segfault'].search(line)
+                if match:
+                    context['faulting_binary'] = match.group(1)
+
+            elif 'call trace' in line_lower:
+                event_type = "Kernel Call Trace"
+            elif 'hardware error' in line_lower or 'mce' in line_lower:
+                event_type = "Hardware Error"
+            
+            # 3. 추적된 이벤트가 있을 경우 결과에 추가
+            if event_type != "Unknown":
+                traced_events.append({
+                    "event_type": event_type,
+                    "timestamp": log_dt.strftime('%Y-%m-%d %H:%M:%S'),
+                    "log_message": line,
+                    "correlated_context": context
+                })
+
+        print(f"✅ 로그 추적 분석 완료. {len(traced_events)}개의 주요 이벤트를 식별하고 컨텍스트를 추가했습니다.")
+        return traced_events
+
 
     def parse(self) -> Dict[str, Any]:
         """주요 sosreport 파일들을 파싱하여 딕셔너리로 반환합니다."""
         print("sosreport 데이터 파싱 시작...")
         system_info = self._parse_system_details()
         system_info['routing_table'] = self._parse_routing_table()
+
+        performance_data = self._parse_sar_data()
+        
+        # [추적 분석] 로그 분석 단계에서 performance_data를 사용하도록 변경
+        traced_log_events = self._analyze_and_trace_logs(performance_data)
 
         data = {
             "system_info": system_info,
@@ -715,9 +796,9 @@ class SosreportParser:
             "storage": self._parse_storage(),
             "process_stats": self._parse_process_stats(),
             "failed_services": self._parse_failed_services(),
-            "performance_data": self._parse_sar_data(),
+            "performance_data": performance_data,
             "installed_packages": self._parse_installed_packages(),
-            "log_messages": self._parse_log_messages(),
+            "traced_log_events": traced_log_events, # 수정된 로그 데이터
             "analysis_timestamp": datetime.now().isoformat()
         }
         print("✅ sosreport 데이터 파싱 완료.")
@@ -757,50 +838,40 @@ class AIAnalyzer:
             print(f"사용 모델: {self.model_name}")
 
     def _setup_korean_font(self):
-        """matplotlib에서 한글을 지원하기 위해 'Malgun Gothic'을 우선적으로 설정하고, 없을 경우 대체 폰트를 찾습니다."""
+        """[폰트 해결] 스크립트 실행 환경에 구애받지 않도록 나눔고딕 폰트를 자동으로 다운로드하여 설정합니다."""
         if not plt:
             return
 
-        # 우선적으로 'Malgun Gothic'을 시도
-        font_name = 'Malgun Gothic'
+        font_filename = "NanumGothicBold.ttf"
+        font_url = f"https://github.com/google/fonts/raw/main/ofl/nanumgothic/{font_filename}"
         
+        # 스크립트와 동일한 디렉토리에 폰트 저장
+        font_path = Path(__file__).parent / font_filename
+
         try:
-            # findfont: 폰트가 없으면 ValueError 발생
-            fm.findfont(font_name, fallback_to_default=False)
-            plt.rc('font', family=font_name)
-            print(f"✅ Matplotlib 그래프 폰트를 '{font_name}'으로 설정했습니다.")
-        except ValueError:
-            print(f"⚠️ '{font_name}' 폰트를 찾을 수 없습니다. 시스템에 맞는 다른 한글 폰트를 검색합니다.")
+            if not font_path.exists():
+                print(f"'{font_filename}' 폰트를 찾을 수 없습니다. 다운로드를 시작합니다...")
+                print(f"URL: {font_url}")
+                urllib.request.urlretrieve(font_url, font_path)
+                print(f"✅ 폰트 다운로드 완료: {font_path}")
             
-            # OS에 따라 대체 폰트 목록 정의
-            if sys.platform == "win32":
-                font_candidates = ["Malgun Gothic", "NanumGothic", "Dotum"]
-            elif sys.platform == "darwin":
-                font_candidates = ["AppleGothic", "NanumGothic"]
-            else: # Linux, etc.
-                font_candidates = ["NanumGothic", "UnDotum"]
-            
-            found_font = None
-            for candidate in font_candidates:
-                try:
-                    fm.findfont(candidate, fallback_to_default=False)
-                    found_font = candidate
-                    break # 첫 번째로 찾은 폰트 사용
-                except ValueError:
-                    continue
-
-            if found_font:
-                plt.rc('font', family=found_font)
-                print(f"✅ 대체 폰트 '{found_font}'으로 설정했습니다.")
+            # matplotlib에 폰트 추가
+            if font_path.exists():
+                fm.fontManager.addfont(str(font_path))
+                # 폰트 이름은 파일 이름에서 확장자를 뺀 것과 다를 수 있으므로, FontProperties로 정확히 가져옴
+                font_prop = fm.FontProperties(fname=str(font_path))
+                font_name = font_prop.get_name() # 'NanumGothic'
+                
+                plt.rc('font', family=font_name)
+                # 마이너스 기호 깨짐 방지
+                plt.rc('axes', unicode_minus=False)
+                print(f"✅ Matplotlib 그래프 폰트를 '{font_name}'으로 설정했습니다.")
             else:
-                print("❌ 시스템에서 사용할 수 있는 한글 폰트를 찾지 못했습니다.")
-                print("  -> 그래프의 한글이 깨질 수 있습니다. '맑은 고딕'이나 '나눔고딕'을 설치해주세요.")
-                if sys.platform.startswith("linux"):
-                    print("  -> (예: sudo apt-get install fonts-nanum*)")
+                 raise FileNotFoundError("폰트 다운로드 후에도 파일을 찾을 수 없음")
 
-        # 마이너스 기호가 깨지는 것을 방지
-        plt.rc('axes', unicode_minus=False)
-
+        except Exception as e:
+            print(f"❌ 한글 폰트 설정 중 오류 발생: {e}")
+            print("  -> 그래프의 한글이 깨질 수 있습니다. 네트워크 연결을 확인하거나 수동으로 폰트를 설치해주세요.")
 
     def list_available_models(self):
         print(f"'{self.llm_url}' 서버에서 사용 가능한 모델 목록을 조회합니다...")
@@ -918,6 +989,7 @@ class AIAnalyzer:
                     raise Exception(f"AI 분석 중 최종 오류 발생: {e}")
 
     def create_analysis_prompt(self, sosreport_data: Dict[str, Any]) -> str:
+        """[추적 분석] 고도화된 AI 분석 프롬프트를 생성합니다."""
         print("AI 분석 프롬프트 생성 중...")
         
         # --- 성능 데이터 요약 ---
@@ -938,13 +1010,14 @@ class AIAnalyzer:
                 total_iowait += entry.get('iowait', 0)
             
             num_entries = len(cpu_data)
-            performance_summary['cpu'] = {
-                "peak_usage_pct": round(peak_cpu_total, 2),
-                "avg_user_pct": round(total_user / num_entries, 2),
-                "avg_system_pct": round(total_system / num_entries, 2),
-                "avg_iowait_pct": round(total_iowait / num_entries, 2),
-                "peak_iowait_pct": round(max(d.get('iowait', 0) for d in cpu_data), 2)
-            }
+            if num_entries > 0:
+                performance_summary['cpu'] = {
+                    "peak_usage_pct": round(peak_cpu_total, 2),
+                    "avg_user_pct": round(total_user / num_entries, 2),
+                    "avg_system_pct": round(total_system / num_entries, 2),
+                    "avg_iowait_pct": round(total_iowait / num_entries, 2),
+                    "peak_iowait_pct": round(max(d.get('iowait', 0) for d in cpu_data), 2)
+                }
 
         # 메모리 요약
         mem_data = performance_data.get('memory', [])
@@ -971,7 +1044,8 @@ class AIAnalyzer:
         # 스왑 요약
         swap_data = performance_data.get('swap', [])
         if swap_data:
-            performance_summary['swap'] = { "peak_usage_pct": round(max(d.get('swpused_pct', 0) for d in swap_data), 2)}
+            peak_swap = max(d.get('swpused_pct', 0) for d in swap_data)
+            performance_summary['swap'] = { "peak_usage_pct": round(peak_swap, 2)}
 
         # Load Average 요약
         load_data = performance_data.get('load', [])
@@ -982,7 +1056,8 @@ class AIAnalyzer:
                 "peak_15min": round(max(d.get('ldavg-15', 0) for d in load_data), 2)
             }
         
-        log_summary = sosreport_data.get("log_messages", [])
+        # [추적 분석] traced_log_events를 프롬프트에 포함
+        traced_events = sosreport_data.get("traced_log_events", [])
         
         data_to_send = {
             "system_info": sosreport_data.get("system_info"),
@@ -993,13 +1068,13 @@ class AIAnalyzer:
                 "zombie_count": len(sosreport_data.get("process_stats", {}).get("zombie", [])),
                 "uninterruptible_count": len(sosreport_data.get("process_stats", {}).get("uninterruptible", []))
             },
-            "performance_summary": performance_summary, # 요약된 성능 데이터 추가
-            "recent_log_warnings_and_errors": log_summary
+            "performance_summary": performance_summary,
+            "traced_log_events": traced_events # [추적 분석] 새로운 데이터 추가
         }
 
-        data_str = json.dumps(data_to_send, indent=2, ensure_ascii=False)
+        data_str = json.dumps(data_to_send, indent=2, ensure_ascii=False, default=json_serializer)
 
-        prompt = f"""당신은 Red Hat Enterprise Linux 시스템 전문가입니다. 다음 sosreport 분석 데이터와 시스템 로그를 종합적으로 검토하고 **한국어로** 전문적인 진단을 제공해주세요.
+        prompt = f"""당신은 Red Hat Enterprise Linux 시스템의 문제를 해결하는 최고 수준의 전문가입니다. 다음 sosreport에서 추출한 '시스템 요약', '성능 요약', 그리고 **'추적 분석 데이터'**를 종합적으로 검토하여, 전문가 수준의 진단과 해결책을 **한국어**로 제공해주세요.
 
 ## 분석 데이터
 ```json
@@ -1007,16 +1082,15 @@ class AIAnalyzer:
 ```
 
 ## 분석 가이드라인
-- **종합적 분석**: `system_info`, `performance_summary`, `recent_log_warnings_and_errors`를 함께 고려하여 시스템의 상태를 종합적으로 진단합니다. 예를 들어, `performance_summary`에서 높은 `iowait` 수치가 관찰되고, `recent_log_warnings_and_errors`에 'i/o error'가 있다면, 이는 심각한 스토리지 문제일 가능성이 높습니다.
-- **성능 데이터 해석**: `performance_summary`의 데이터를 해석하여 성능 병목 현상(예: 지속적인 높은 CPU 사용률, 과도한 스왑 사용, 높은 Load Average)을 식별하고, 이를 '경고' 또는 '심각한 이슈'로 보고합니다.
-- **심각한 이슈(critical_issues) 판단 기준**: 로그 내용에 'panic', 'segfault', 'out of memory', 'hardware error', 'i/o error', 'call trace'와 같은 명백한 시스템 장애나 데이터 손상 가능성을 암시하는 키워드가 포함된 경우, **반드시 '심각한 이슈'로 분류**해야 합니다.
-- **경고(warnings) 판단 기준**: 당장 시스템 장애를 일으키지는 않지만, 잠재적인 문제로 발전할 수 있거나 주의가 필요한 로그(예: 'warning', 'failed' 등) 또는 성능 지표(예: 높은 I/O 대기, 스왑 사용)는 '경고'로 분류합니다.
+1.  **추적 분석 데이터(traced_log_events) 최우선 분석**: 이 데이터는 시스템에서 발생한 핵심 오류와 그 당시의 시스템 상태를 연결한 것입니다. 각 이벤트의 `log_message`와 `correlated_context`를 함께 분석하여 문제의 **근본 원인**을 추론하세요.
+    * **예시**: `event_type`이 'I/O Error'이고, `correlated_context`에 높은 `iowait` 수치와 `dmesg`의 디스크 에러가 함께 있다면, 이는 애플리케이션 문제가 아닌 명백한 스토리지 하드웨어 또는 드라이버 문제입니다. 따라서 권장사항은 '디스크 상태 점검(smartctl), 스토리지 시스템 확인'이 되어야 합니다.
+    * **예시**: `event_type`이 'Out of Memory'이고, `correlated_context`에 특정 프로세스가 메모리를 과도하게 사용한 `dmesg_oom_details`가 있다면, 해당 프로세스의 메모리 누수나 설정 오류를 의심해야 합니다.
 
+2.  **심각한 이슈(critical_issues) 판단 기준**: `traced_log_events`에 포함된 모든 이벤트는 잠재적으로 심각한 문제입니다. 특히 'I/O Error', 'Out of Memory', 'Hardware Error', 'Kernel Call Trace'는 시스템 다운이나 데이터 손상을 유발할 수 있으므로 **반드시 '심각한 이슈'로 분류**하고, 추적 분석 컨텍스트를 기반으로 구체적인 위험성을 설명해야 합니다.
 
-## 분석 절차 (내부적으로만 수행)
-1.  **예비 분석**: 주어진 모든 데이터를 검토하고, 특히 `recent_log_warnings_and_errors` 목록에서 'panic', 'i/o error' 등 심각도를 나타내는 키워드를 식별하여 잠재적 이슈의 우선순위를 정합니다.
-2.  **JSON 초안 작성 (내부적)**: 1단계 분석을 바탕으로, `critical_issues`, `warnings`, `recommendations` 항목을 채운 JSON 구조의 초안을 마음속으로 구성합니다. 이때, 각 권장사항(`recommendations`)이 어떤 로그(`related_logs`)나 성능 지표에 근거하는지 명확히 연결합니다.
-3.  **최종 JSON 검토 및 출력**: 2단계에서 구성한 초안을 최종적으로 검토하고, 빠진 내용이나 불일치는 없는지 확인한 후, 완전한 JSON 객체 **하나만을** 출력합니다.
+3.  **경고(warnings) 판단 기준**: 당장 시스템 장애를 일으키지는 않지만, 잠재적인 문제로 발전할 수 있는 성능 지표(예: 지속적인 높은 `peak_iowait_pct`, 과도한 `swap` 사용)나 `failed_services` 목록을 '경고'로 분류합니다.
+
+4.  **권장사항(recommendations) 구체화**: 모든 권장사항은 분석 데이터에 기반해야 합니다. '어떤 문제(issue)'가 '어떤 해결책(solution)'으로 이어지는지 명확히 제시하고, 가능하다면 `related_logs` 필드에 근거가 된 `traced_log_events`의 `log_message`를 포함하여 신뢰도를 높여주세요.
 
 ## 최종 출력 형식
 **모든 `critical_issues`, `warnings`, `recommendations`, `summary` 필드의 내용은 반드시 자연스러운 한국어로 작성해주세요.**
@@ -1025,22 +1099,22 @@ class AIAnalyzer:
 {{
   "system_status": "정상|주의|위험",
   "overall_health_score": 100,
-  "critical_issues": ["분석 가이드라인에 따라 식별된 심각한 문제들의 구체적인 설명"],
-  "warnings": ["주의가 필요한 사항들"],
+  "critical_issues": ["추적 분석 데이터를 기반으로 식별된 심각한 문제들의 구체적인 설명"],
+  "warnings": ["주의가 필요한 성능 지표나 서비스 실패 등의 사항"],
   "recommendations": [
     {{
       "priority": "높음|중간|낮음",
       "category": "성능|보안|안정성|유지보수",
-      "issue": "문제점 설명",
-      "solution": "구체적인 해결 방안",
+      "issue": "근본 원인에 대한 설명",
+      "solution": "구체적이고 실행 가능한 해결 방안",
       "related_logs": ["이 권장사항의 근거가 된 특정 로그 메시지(들)"]
     }}
   ],
-  "summary": "전체적인 시스템 상태와 주요 권장사항에 대한 종합 요약"
+  "summary": "전체적인 시스템 상태와 추적 분석을 통해 발견된 핵심 문제, 그리고 가장 시급한 권장사항에 대한 종합 요약"
 }}
 ```
 
-**중요**: 위 분석 절차에 따라 분석을 완료하고, 당신의 전체 응답은 오직 위 형식의 단일 JSON 객체여야 합니다. `related_logs` 필드는 근거가 된 로그가 없을 경우 빈 배열 `[]`로 출력해주세요. JSON 객체 앞뒤로 어떠한 설명, 요약, 추론 과정도 포함하지 마십시오.
+**중요**: 당신의 전체 응답은 오직 위 형식의 단일 JSON 객체여야 합니다. JSON 객체 앞뒤로 어떠한 설명, 요약, 추론 과정도 포함하지 마십시오.
 """
         return prompt
 
@@ -2232,6 +2306,12 @@ def decompress_sosreport(archive_path: str, extract_dir: str) -> str:
   - STDERR: {e.stderr.decode(errors='ignore') if e.stderr else ''}"""
             raise Exception(error_message)
 
+# [오류 수정] JSON 직렬화를 위한 헬퍼 함수
+def json_serializer(obj):
+    """datetime 객체를 JSON 직렬화 가능하도록 ISO 포맷 문자열로 변환합니다."""
+    if isinstance(obj, (datetime, date)):
+        return obj.isoformat()
+    raise TypeError(f"Object of type '{type(obj).__name__}' is not JSON serializable")
 
 def main():
     parser = argparse.ArgumentParser(description='sosreport 압축 파일 AI 분석 및 보고서 생성 도구', formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -2301,10 +2381,14 @@ def main():
         parsed_data_path = Path(args.output) / f"{base_name}_extracted_data.json"
         try:
             with open(parsed_data_path, 'w', encoding='utf-8') as f:
-                json.dump(sos_data, f, indent=2, ensure_ascii=False)
+                # [오류 수정] json.dump에 default=json_serializer 추가
+                json.dump(sos_data, f, indent=2, ensure_ascii=False, default=json_serializer)
             print(f"✅ 전체 추출 데이터 JSON 파일로 저장 완료: {parsed_data_path}")
+        except TypeError as e:
+            print(f"❌ 전체 추출 데이터 JSON 저장 실패: 직렬화할 수 없는 데이터 타입이 포함되어 있습니다. 오류: {e}")
         except Exception as e:
             print(f"❌ 전체 추출 데이터 JSON 저장 실패: {e}")
+
 
         prompt = analyzer.create_analysis_prompt(sos_data)
         result = analyzer.perform_ai_analysis(prompt)
