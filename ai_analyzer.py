@@ -519,7 +519,7 @@ class SosreportParser:
             chosen_path = 'sos_commands/monitoring/sar_-A'
             if content == 'N/A' or not content.strip():
                 print("❌ 분석할 수 있는 sar 데이터를 찾지 못했습니다.")
-                return {'cpu': [], 'memory': [], 'network': [], 'disk': [], 'load': []}
+                return {'cpu': [], 'memory': [], 'network': [], 'disk': [], 'load': [], 'swap': []}
 
         # --- 데이터 유무 진단 ---
         if 'IFACE' not in content:
@@ -537,19 +537,20 @@ class SosreportParser:
             num_net = len(set(d.get('timestamp') for d in performance_data.get('network', [])))
             num_disk = len(set(d.get('timestamp') for d in performance_data.get('disk', [])))
             num_load = len(performance_data.get('load', []))
+            num_swap = len(performance_data.get('swap', []))
             print(f"✅ sar 데이터 파싱 성공: {chosen_path} "
-                  f"(CPU: {num_cpu}, Mem: {num_mem}, Net: {num_net}, Disk: {num_disk}, Load: {num_load})")
+                  f"(CPU: {num_cpu}, Mem: {num_mem}, Net: {num_net}, Disk: {num_disk}, Load: {num_load}, Swap: {num_swap})")
             return performance_data
         else:
             print(f"    - {chosen_path} 파일에서 유효한 성능 데이터를 추출하지 못했습니다.")
-            return {'cpu': [], 'memory': [], 'network': [], 'disk': [], 'load': []}
+            return {'cpu': [], 'memory': [], 'network': [], 'disk': [], 'load': [], 'swap': []}
 
     def _parse_sar_text_content(self, sar_content: str) -> Dict[str, List[Dict[str, Any]]]:
         """
         고도화된 sar 텍스트 파서. 데이터 블록을 명확히 인지하여 다양한 sar 출력 형식에 안정적으로 대응합니다.
         """
         print("  -> 고도화된 sar 파서 실행 중...")
-        performance_data = {'cpu': [], 'memory': [], 'network': [], 'disk': [], 'load': []}
+        performance_data = {'cpu': [], 'memory': [], 'network': [], 'disk': [], 'load': [], 'swap': []}
         lines = sar_content.strip().replace('\r\n', '\n').split('\n')
         
         header_map = {}
@@ -592,6 +593,8 @@ class SosreportParser:
                     current_section = 'disk'
                 elif 'runq-sz' in metric_cols:
                     current_section = 'load'
+                elif 'kbswpfree' in metric_cols and '%swpused' in metric_cols:
+                    current_section = 'swap'
                 
                 if current_section:
                     header_map = {}
@@ -639,6 +642,11 @@ class SosreportParser:
                         'ldavg-1': float(entry.get('ldavg-1', '0').replace(',', '.')),
                         'ldavg-5': float(entry.get('ldavg-5', '0').replace(',', '.')),
                         'ldavg-15': float(entry.get('ldavg-15', '0').replace(',', '.'))
+                    })
+                elif current_section == 'swap':
+                    performance_data['swap'].append({
+                        'timestamp': timestamp,
+                        'swpused_pct': float(entry.get('pct_swpused', '0').replace(',', '.'))
                     })
             except (ValueError, IndexError, KeyError) as e:
                 print(f"  -> sar 데이터 라인 파싱 경고: {e} | 라인: '{line}'")
@@ -912,6 +920,68 @@ class AIAnalyzer:
     def create_analysis_prompt(self, sosreport_data: Dict[str, Any]) -> str:
         print("AI 분석 프롬프트 생성 중...")
         
+        # --- 성능 데이터 요약 ---
+        performance_data = sosreport_data.get("performance_data", {})
+        performance_summary = {}
+
+        # CPU 요약
+        cpu_data = performance_data.get('cpu', [])
+        if cpu_data:
+            peak_cpu_total = 0
+            total_user, total_system, total_iowait = 0, 0, 0
+            for entry in cpu_data:
+                total = entry.get('user', 0) + entry.get('system', 0) + entry.get('iowait', 0)
+                if total > peak_cpu_total:
+                    peak_cpu_total = total
+                total_user += entry.get('user', 0)
+                total_system += entry.get('system', 0)
+                total_iowait += entry.get('iowait', 0)
+            
+            num_entries = len(cpu_data)
+            performance_summary['cpu'] = {
+                "peak_usage_pct": round(peak_cpu_total, 2),
+                "avg_user_pct": round(total_user / num_entries, 2),
+                "avg_system_pct": round(total_system / num_entries, 2),
+                "avg_iowait_pct": round(total_iowait / num_entries, 2),
+                "peak_iowait_pct": round(max(d.get('iowait', 0) for d in cpu_data), 2)
+            }
+
+        # 메모리 요약
+        mem_data = performance_data.get('memory', [])
+        if mem_data:
+            total_mem_used_pct = 0
+            count = 0
+            for entry in mem_data:
+                try:
+                    if 'pct_memused' in entry:
+                        total_mem_used_pct += float(entry['pct_memused'].replace(',', '.'))
+                        count += 1
+                    else:
+                        kbmemused = float(entry.get('kbmemused', '0').replace(',', '.'))
+                        kbmemfree = float(entry.get('kbmemfree', '0').replace(',', '.'))
+                        total_mem = kbmemused + kbmemfree
+                        if total_mem > 0:
+                            total_mem_used_pct += (kbmemused / total_mem) * 100
+                            count += 1
+                except (ValueError, KeyError):
+                    continue
+            if count > 0:
+                performance_summary['memory'] = {"avg_usage_pct": round(total_mem_used_pct / count, 2)}
+
+        # 스왑 요약
+        swap_data = performance_data.get('swap', [])
+        if swap_data:
+            performance_summary['swap'] = { "peak_usage_pct": round(max(d.get('swpused_pct', 0) for d in swap_data), 2)}
+
+        # Load Average 요약
+        load_data = performance_data.get('load', [])
+        if load_data:
+            performance_summary['load_average'] = {
+                "peak_1min": round(max(d.get('ldavg-1', 0) for d in load_data), 2),
+                "peak_5min": round(max(d.get('ldavg-5', 0) for d in load_data), 2),
+                "peak_15min": round(max(d.get('ldavg-15', 0) for d in load_data), 2)
+            }
+        
         log_summary = sosreport_data.get("log_messages", [])
         
         data_to_send = {
@@ -923,6 +993,7 @@ class AIAnalyzer:
                 "zombie_count": len(sosreport_data.get("process_stats", {}).get("zombie", [])),
                 "uninterruptible_count": len(sosreport_data.get("process_stats", {}).get("uninterruptible", []))
             },
+            "performance_summary": performance_summary, # 요약된 성능 데이터 추가
             "recent_log_warnings_and_errors": log_summary
         }
 
@@ -936,12 +1007,15 @@ class AIAnalyzer:
 ```
 
 ## 분석 가이드라인
+- **종합적 분석**: `system_info`, `performance_summary`, `recent_log_warnings_and_errors`를 함께 고려하여 시스템의 상태를 종합적으로 진단합니다. 예를 들어, `performance_summary`에서 높은 `iowait` 수치가 관찰되고, `recent_log_warnings_and_errors`에 'i/o error'가 있다면, 이는 심각한 스토리지 문제일 가능성이 높습니다.
+- **성능 데이터 해석**: `performance_summary`의 데이터를 해석하여 성능 병목 현상(예: 지속적인 높은 CPU 사용률, 과도한 스왑 사용, 높은 Load Average)을 식별하고, 이를 '경고' 또는 '심각한 이슈'로 보고합니다.
 - **심각한 이슈(critical_issues) 판단 기준**: 로그 내용에 'panic', 'segfault', 'out of memory', 'hardware error', 'i/o error', 'call trace'와 같은 명백한 시스템 장애나 데이터 손상 가능성을 암시하는 키워드가 포함된 경우, **반드시 '심각한 이슈'로 분류**해야 합니다.
-- **경고(warnings) 판단 기준**: 당장 시스템 장애를 일으키지는 않지만, 잠재적인 문제로 발전할 수 있거나 주의가 필요한 로그(예: 'warning', 'failed' 등)는 '경고'로 분류합니다.
+- **경고(warnings) 판단 기준**: 당장 시스템 장애를 일으키지는 않지만, 잠재적인 문제로 발전할 수 있거나 주의가 필요한 로그(예: 'warning', 'failed' 등) 또는 성능 지표(예: 높은 I/O 대기, 스왑 사용)는 '경고'로 분류합니다.
+
 
 ## 분석 절차 (내부적으로만 수행)
 1.  **예비 분석**: 주어진 모든 데이터를 검토하고, 특히 `recent_log_warnings_and_errors` 목록에서 'panic', 'i/o error' 등 심각도를 나타내는 키워드를 식별하여 잠재적 이슈의 우선순위를 정합니다.
-2.  **JSON 초안 작성 (내부적)**: 1단계 분석을 바탕으로, `critical_issues`, `warnings`, `recommendations` 항목을 채운 JSON 구조의 초안을 마음속으로 구성합니다. 이때, 각 권장사항(`recommendations`)이 어떤 로그(`related_logs`)에 근거하는지 명확히 연결합니다.
+2.  **JSON 초안 작성 (내부적)**: 1단계 분석을 바탕으로, `critical_issues`, `warnings`, `recommendations` 항목을 채운 JSON 구조의 초안을 마음속으로 구성합니다. 이때, 각 권장사항(`recommendations`)이 어떤 로그(`related_logs`)나 성능 지표에 근거하는지 명확히 연결합니다.
 3.  **최종 JSON 검토 및 출력**: 2단계에서 구성한 초안을 최종적으로 검토하고, 빠진 내용이나 불일치는 없는지 확인한 후, 완전한 JSON 객체 **하나만을** 출력합니다.
 
 ## 최종 출력 형식
@@ -1512,6 +1586,32 @@ class AIAnalyzer:
             except Exception as e:
                 print(f"  - ⚠️ Load Average 그래프 생성 실패: {e}")
 
+        # --- Swap 그래프 ---
+        if perf_data.get('swap') and len(perf_data['swap']) > 1:
+            try:
+                swap_data, timestamps = perf_data['swap'], [d['timestamp'] for d in perf_data['swap']]
+                swpused_pct = [d['swpused_pct'] for d in swap_data]
+
+                fig, ax = plt.subplots(figsize=graph_style['figsize'])
+                ax.plot(timestamps, swpused_pct, label='Swap Used %', color='#9B59B6')
+                ax.fill_between(timestamps, swpused_pct, color='#9B59B6', alpha=0.3)
+
+                ax.set_title('Swap Usage (%)', fontsize=graph_style['title_fontsize'], weight='bold')
+                ax.set_ylabel('Usage (%)', fontsize=graph_style['label_fontsize'])
+                ax.legend(loc='upper left', frameon=True)
+                ax.set_ylim(0, max(100, max(swpused_pct) * 1.1 if swpused_pct else 100)) # Adjust Y-axis limit
+                ax.xaxis.set_major_locator(mticker.MaxNLocator(nbins=10, prune='both'))
+                plt.xticks(rotation=graph_style['tick_rotation'], ha='right')
+                plt.tight_layout()
+
+                buf = io.BytesIO()
+                fig.savefig(buf, format='png', dpi=100)
+                graphs['swap_graph'] = base64.b64encode(buf.getvalue()).decode('utf-8')
+                plt.close(fig)
+                print("  - Swap 사용률 그래프 생성 완료")
+            except Exception as e:
+                print(f"  - ⚠️ Swap 사용률 그래프 생성 실패: {e}")
+
         print("✅ 모든 성능 그래프 생성 시도 완료.")
         return graphs
 
@@ -1786,6 +1886,7 @@ class AIAnalyzer:
         static_graph_items = {
             'cpu_graph': 'CPU Usage (%)', 
             'memory_graph': 'Memory Usage (KB)', 
+            'swap_graph': 'Swap Usage (%)',
             'load_average_graph': 'System Load Average',
             'disk_graph': 'Disk I/O (kB/s)'
         }
