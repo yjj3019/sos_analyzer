@@ -2432,7 +2432,7 @@ def main():
         print(f"sosreport 파일에서 호스트명 식별: {hostname}")
         
         # 요청된 경로 형식으로 압축 해제 디렉토리 설정
-        extract_dir = Path(f"/tmp/sos_analyzer/{hostname}")
+        extract_dir = Path(f"/tmp/sos_analyzer")
         
         # 만약 디렉토리가 이미 존재하면, 새로 압축을 풀기 위해 삭제
         if extract_dir.exists():
