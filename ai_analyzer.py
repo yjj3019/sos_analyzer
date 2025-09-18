@@ -5,7 +5,7 @@ sosreport 압축 파일을 입력받아 압축 해제, 데이터 추출, AI 분�
 
 사용법:
     # 기본 사용법 (sosreport 압축 파일을 입력)
-    python3 ai_analyzer.py sosreport-archive.tar.xz --llm-url <URL> --model <MODEL> --api-token <TOKEN>
+    python3 sos_analyzer.py sosreport-archive.tar.xz --llm-url <URL> --model <MODEL> --api-token <TOKEN>
 """
 
 import os
@@ -2412,14 +2412,40 @@ def main():
 
     os.makedirs(args.output, exist_ok=True)
     
-    temp_extract_dir = None
     try:
-        temp_extract_dir = tempfile.mkdtemp(prefix=f"sos_{Path(args.sosreport_archive).stem}_")
-        print(f"시스템 임시 경로에 작업 디렉토리 생성: {temp_extract_dir}")
+        # --- NEW: 압축 해제 경로 생성 로직 ---
+        archive_filename = Path(args.sosreport_archive).name
+        hostname = ""
+        # sosreport-<hostname>-<datestamp>-<random> 형식에서 호스트명 추출
+        match = re.match(r"sosreport-(.*?)-\d{4}-\d{2}-\d{2}-", archive_filename)
+        if match:
+            hostname = match.group(1)
+        else:
+            # 다른 형식의 sosreport 파일명을 위한 예비 패턴
+            match = re.match(r"sosreport-([a-zA-Z0-9.-]+)-\d+", archive_filename)
+            if match:
+                hostname = match.group(1)
+            else:
+                # 패턴 매칭 실패 시, 파일명에서 안전한 디렉토리명 생성
+                hostname = Path(args.sosreport_archive).stem.replace('.tar', '')
         
-        decompress_sosreport(args.sosreport_archive, str(temp_extract_dir))
+        print(f"sosreport 파일에서 호스트명 식별: {hostname}")
         
-        parser = SosreportParser(str(temp_extract_dir))
+        # 요청된 경로 형식으로 압축 해제 디렉토리 설정
+        extract_dir = Path(f"/tmp/sos_analyzer/{hostname}")
+        
+        # 만약 디렉토리가 이미 존재하면, 새로 압축을 풀기 위해 삭제
+        if extract_dir.exists():
+            print(f"기존 분석 디렉토리 정리: {extract_dir}")
+            shutil.rmtree(extract_dir)
+
+        os.makedirs(extract_dir)
+        print(f"분석 디렉토리 생성: {extract_dir}")
+        # --- 로직 변경 완료 ---
+
+        decompress_sosreport(args.sosreport_archive, str(extract_dir))
+        
+        parser = SosreportParser(str(extract_dir))
         sos_data = parser.parse()
 
         base_name = Path(args.sosreport_archive).stem.replace('.tar', '')
@@ -2462,16 +2488,6 @@ def main():
         import traceback
         traceback.print_exc()
         sys.exit(1)
-    finally:
-        if temp_extract_dir and os.path.exists(temp_extract_dir):
-            print(f"임시 디렉토리 정리 시도: {temp_extract_dir}")
-            try:
-                shutil.rmtree(temp_extract_dir)
-                print("✅ 임시 디렉토리 정리 완료.")
-            except Exception as e:
-                print(f"❌ 임시 디렉토리 자동 정리에 실패했습니다: {e}")
-                print(f"   수동으로 디렉토리를 삭제해주세요: sudo rm -rf {temp_extract_dir}")
 
 if __name__ == "__main__":
     main()
-
