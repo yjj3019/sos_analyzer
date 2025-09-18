@@ -2114,8 +2114,19 @@ class AIAnalyzer:
             margin-bottom: 1rem; padding-bottom: 0.5rem; border-bottom: 2px solid var(--light-gray);
         }}
         .card-body h3:first-child {{ margin-top: 0; }}
-        .data-table {{ width: 100%; border-collapse: collapse; font-size: 0.95em; }}
-        .data-table th, .data-table td {{ padding: 0.9rem 1rem; text-align: left; border-bottom: 1px solid var(--border-color); }}
+        .data-table {{
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 0.95em;
+            table-layout: auto; /* [수정] 콘텐츠 기반으로 테이블 셀 너비를 자동 조절하여 겹침 방지 */
+        }}
+        .data-table th, .data-table td {{
+            padding: 0.9rem 1rem;
+            text-align: left;
+            border-bottom: 1px solid var(--border-color);
+            word-wrap: break-word; /* [수정] 긴 텍스트가 셀을 넘어가지 않도록 자동 줄바꿈 */
+            overflow-wrap: break-word; /* [수정] 표준 word-wrap 속성 */
+        }}
         .data-table thead th {{
             background-color: #f7f9fc; color: var(--secondary-color); font-weight: 600;
             border-bottom: 2px solid var(--primary-color);
@@ -2420,39 +2431,39 @@ def main():
     os.makedirs(args.output, exist_ok=True)
     
     try:
-        # --- NEW: 압축 해제 경로 생성 로직 ---
-        archive_filename = Path(args.sosreport_archive).name
-        hostname = ""
-        # sosreport-<hostname>-<datestamp>-<random> 형식에서 호스트명 추출
-        match = re.match(r"sosreport-(.*?)-\d{4}-\d{2}-\d{2}-", archive_filename)
-        if match:
-            hostname = match.group(1)
-        else:
-            # 다른 형식의 sosreport 파일명을 위한 예비 패턴
-            match = re.match(r"sosreport-([a-zA-Z0-9.-]+)-\d+", archive_filename)
-            if match:
-                hostname = match.group(1)
-            else:
-                # 패턴 매칭 실패 시, 파일명에서 안전한 디렉토리명 생성
-                hostname = Path(args.sosreport_archive).stem.replace('.tar', '')
-        
-        print(f"sosreport 파일에서 호스트명 식별: {hostname}")
-        
-        # 요청된 경로 형식으로 압축 해제 디렉토리 설정
-        extract_dir = Path(f"/tmp/sos_analyzer")
-        
-        # 만약 디렉토리가 이미 존재하면, 새로 압축을 풀기 위해 삭제
-        if extract_dir.exists():
-            print(f"기존 분석 디렉토리 정리: {extract_dir}")
-            shutil.rmtree(extract_dir)
+        # --- [수정] 임시 디렉토리 관리 로직 변경 ---
+        # 기본 관리 디렉토리를 정의하고, 존재하지 않으면 생성합니다.
+        base_temp_dir = Path("/tmp/sos_analyzer")
+        base_temp_dir.mkdir(parents=True, exist_ok=True)
+        print(f"임시 관리 디렉토리: {base_temp_dir}")
 
-        os.makedirs(extract_dir)
-        print(f"분석 디렉토리 생성: {extract_dir}")
+        # 관리 디렉토리 내부의 이전 분석 내용만 정리합니다. '/tmp/sos_analyzer' 자체는 삭제하지 않습니다.
+        print(f"'{base_temp_dir}' 내부의 이전 분석 데이터 정리 시작...")
+        for item in base_temp_dir.iterdir():
+            print(f"  -> 삭제 대상: {item}")
+            try:
+                # 파일 속성 변경 (Permission Denied 방지)
+                if sys.platform != "win32" and item.is_dir():
+                     subprocess.run(['chattr', '-R', '-i', str(item)], check=False, stderr=subprocess.PIPE)
+
+                if item.is_dir():
+                    shutil.rmtree(item)
+                else:
+                    item.unlink()
+                print(f"     ...삭제 완료.")
+            except Exception as e:
+                print(f"⚠️ '{item}' 삭제 중 오류 발생: {e}. 계속 진행합니다.")
+
+        # sosreport 압축 해제는 관리 디렉토리 바로 아래에 수행합니다.
+        # 압축 파일 내에 상위 디렉토리가 포함되어 있으므로, 새로운 디렉토리를 미리 만들 필요가 없습니다.
+        extract_target_dir = base_temp_dir
+        print(f"압축 해제 대상 디렉토리 설정: {extract_target_dir}")
         # --- 로직 변경 완료 ---
 
-        decompress_sosreport(args.sosreport_archive, str(extract_dir))
+        decompress_sosreport(args.sosreport_archive, str(extract_target_dir))
         
-        parser = SosreportParser(str(extract_dir))
+        # SosreportParser는 압축 해제 후 생성된 하위 디렉토리를 자동으로 찾아 분석을 시작합니다.
+        parser = SosreportParser(str(extract_target_dir))
         sos_data = parser.parse()
 
         base_name = Path(args.sosreport_archive).stem.replace('.tar', '')
