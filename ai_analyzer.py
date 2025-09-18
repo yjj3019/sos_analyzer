@@ -1873,7 +1873,7 @@ class AIAnalyzer:
                 <h3>ETHTOOL 상태</h3>
                 <table class="data-table ethtool-table">
                     <thead><tr><th>Interface</th><th>PCI Bus</th><th>Link Status</th><th>RX Ring</th><th>Driver / Firmware</th><th>Errors</th></tr></thead>
-                    <tbody>{ create_ethtool_rows(network_details.get('ethtool', {{}})) }</tbody>
+                    <tbody>{ create_ethtool_rows(network_details.get('ethtool', {})) }</tbody>
                 </table>
                  <h3>NETDEV 통계</h3>
                 <table class="data-table">
@@ -2123,8 +2123,8 @@ def main():
                 shutil.rmtree(temp_extract_dir)
                 print("✅ 임시 디렉토리 정리 완료.")
             except Exception as e:
-                print(f"\n❌ 임시 디렉토리 자동 정리에 실패했습니다: {e}")
-                print("   sudo rm -rf {temp_extract_dir}\n")
+                print(f"❌ 임시 디렉토리 자동 정리에 실패했습니다: {e}")
+                print(f"   수동으로 디렉토리를 삭제해주세요: sudo rm -rf {temp_extract_dir}")
 
 if __name__ == "__main__":
     main()
