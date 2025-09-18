@@ -207,14 +207,20 @@ class SosreportParser:
         return filesystems
 
     def _parse_process_stats(self) -> Dict[str, Any]:
+        """
+        ps 출력을 파싱하여 xsos 스타일로 프로세스 통계를 생성합니다.
+        - 상위 5개 사용자 (CPU, MEM, RSS 기준)
+        - 상위 5개 CPU 및 메모리 사용 프로세스
+        - Uninterruptible (D) 및 Zombie (Z) 상태의 프로세스 목록
+        """
         ps_content = self._read_file(['sos_commands/process/ps_auxwww', 'sos_commands/process/ps_auxwwwm', 'ps'])
         if ps_content == 'N/A':
             return {'total': 0, 'by_user': [], 'uninterruptible': [], 'zombie': [], 'top_cpu': [], 'top_mem': []}
 
         lines = ps_content.split('\n')
-        header_found = False
         processes = []
-        
+        header_found = False
+
         for line in lines:
             if re.match(r'USER\s+PID\s+%CPU', line):
                 header_found = True
@@ -227,7 +233,7 @@ class SosreportParser:
                 try:
                     processes.append({
                         'user': parts[0], 'pid': parts[1], 'cpu%': float(parts[2]),
-                        'mem%': float(parts[3]), 'vsz': int(parts[4]), 'rss': int(parts[5]),
+                        'mem%': float(parts[3]), 'vsz': int(parts[4]), 'rss': int(parts[5]), # RSS는 KB 단위
                         'stat': parts[7], 'start': parts[8], 'time': parts[9], 'command': parts[10]
                     })
                 except (ValueError, IndexError):
@@ -246,19 +252,38 @@ class SosreportParser:
             user_stats[user]['mem%'] += p['mem%']
             user_stats[user]['rss'] += p['rss']
         
+        # CPU 사용량 기준으로 상위 사용자 정렬
         top_users = sorted(user_stats.items(), key=lambda item: item[1]['cpu%'], reverse=True)[:5]
         
+        # xsos 형식에 맞게 RSS 단위를 동적으로 변환
+        def format_rss(rss_kb):
+            if rss_kb > 1024 * 1024:
+                return f"{rss_kb / 1024 / 1024:.2f} GiB"
+            elif rss_kb > 1024:
+                return f"{rss_kb / 1024:.2f} MiB"
+            return f"{rss_kb:.2f} KiB"
+
         formatted_top_users = []
         for user, stats in top_users:
             formatted_top_users.append({
                 'user': user,
                 'cpu%': f"{stats['cpu%']:.1f}%",
                 'mem%': f"{stats['mem%']:.1f}%",
-                'rss': f"{stats['rss'] / 1024 / 1024:.2f} GiB" if stats['rss'] > 1024*1024 else f"{stats['rss'] / 1024:.2f} MiB"
+                'rss': format_rss(stats['rss'])
             })
-        
+            
+        # Top CPU 및 Memory 프로세스 정렬
         top_cpu = sorted(processes, key=lambda p: p['cpu%'], reverse=True)[:5]
         top_mem = sorted(processes, key=lambda p: p['rss'], reverse=True)[:5]
+        
+        # Top 메모리 프로세스의 RSS 값도 포맷팅
+        for p in top_mem:
+            p['rss_formatted'] = format_rss(p['rss'])
+        for p in uninterruptible:
+            p['rss_formatted'] = format_rss(p['rss'])
+        for p in zombie:
+            p['rss_formatted'] = format_rss(p['rss'])
+
 
         print(f"✅ 프로세스 통계 파싱 완료: {total_processes}개 프로세스")
         return {
@@ -347,31 +372,92 @@ class SosreportParser:
                 bond_info['slaves'] = slaves
                 details['bonding'].append(bond_info)
         
+        # --- ETHTOOL parsing (xsos style) ---
         ethtool_dir = self.base_path / 'sos_commands/networking'
         if ethtool_dir.is_dir():
             all_ifaces = [dev['iface'] for dev in details['netdev']]
-            for iface_name in all_ifaces:
-                details['ethtool'][iface_name] = {}
-                
-                content = self._read_file([f'sos_commands/networking/ethtool_{iface_name}'])
-                link_match = re.search(r'Link detected:\s*(yes|no)', content)
-                speed_match = re.search(r'Speed:\s*(.*)', content)
-                driver_match = re.search(r'driver:\s*(.*)', content)
-                fw_match = re.search(r'firmware-version:\s*(.*)', content)
-                
-                details['ethtool'][iface_name]['link'] = link_match.group(1) if link_match else 'N/A'
-                details['ethtool'][iface_name]['speed'] = speed_match.group(1).strip() if speed_match else 'N/A'
-                details['ethtool'][iface_name]['driver'] = driver_match.group(1).strip() if driver_match else 'N/A'
-                details['ethtool'][iface_name]['firmware'] = fw_match.group(1).strip() if fw_match else 'N/A'
+            if 'lo' not in all_ifaces:
+                 all_ifaces.append('lo')
 
+            for iface_name in sorted(all_ifaces):
+                iface_data = {}
+
+                # 1. Info from `ethtool -i <iface>`
+                content_i = self._read_file([f'sos_commands/networking/ethtool_-i_{iface_name}'])
+                pci_bus = re.search(r'bus-info:\s*(.*)', content_i)
+                driver = re.search(r'driver:\s*(.*)', content_i)
+                version = re.search(r'version:\s*(.*)', content_i)
+                firmware = re.search(r'firmware-version:\s*(.*)', content_i)
+
+                iface_data['pci_bus'] = pci_bus.group(1).strip() if pci_bus else 'PCI UNKNOWN'
+                driver_str = driver.group(1).strip() if driver else 'UNKNOWN'
+                version_str = f" v{version.group(1).strip()}" if version and version.group(1).strip() else ''
+                firmware_str = firmware.group(1).strip() if firmware else 'UNKNOWN'
+                iface_data['driver_info'] = f"drv {driver_str}{version_str} / fw {firmware_str}"
+
+                # 2. Info from `ethtool <iface>`
+                content_main = self._read_file([f'sos_commands/networking/ethtool_{iface_name}'])
+                link_detected = re.search(r'Link detected:\s*(yes|no)', content_main)
+                speed = re.search(r'Speed:\s*(.*)', content_main)
+                duplex = re.search(r'Duplex:\s*(.*)', content_main)
+                autoneg = re.search(r'Auto-negotiation:\s*(on|off)', content_main)
+
+                iface_data['link_status'] = "UNKNOWN"
+                if link_detected:
+                    iface_data['link_status'] = "up" if link_detected.group(1) == 'yes' else "DOWN"
+                
+                link_details_str = ""
+                if iface_data['link_status'] == "up" and speed:
+                    speed_str = speed.group(1).strip()
+                    duplex_str = duplex.group(1).strip().lower() if duplex else ""
+                    autoneg_str = "Y" if autoneg and autoneg.group(1) == 'on' else "N"
+                    link_details_str = f"{speed_str} {duplex_str} (autoneg={autoneg_str})"
+                elif iface_data['link_status'] == 'DOWN' and autoneg:
+                     autoneg_str = "Y" if autoneg.group(1) == 'on' else "N"
+                     link_details_str = f'(autoneg={autoneg_str})'
+                iface_data['link_details'] = link_details_str
+
+                # 3. Info from `ethtool -g <iface>`
+                content_g = self._read_file([f'sos_commands/networking/ethtool_-g_{iface_name}'])
+                rx_max, rx_now = '?', '?'
+                
+                in_preset_max, in_current_hw = False, False
+                for line in content_g.split('\n'):
+                    if 'Pre-set maximums:' in line:
+                        in_preset_max, in_current_hw = True, False
+                        continue
+                    if 'Current hardware settings:' in line:
+                        in_preset_max, in_current_hw = False, True
+                        continue
+                    
+                    if in_preset_max and line.strip().startswith('RX:'):
+                        parts = line.split()
+                        if len(parts) >= 2: rx_max = parts[1]
+                        in_preset_max = False
+                    elif in_current_hw and line.strip().startswith('RX:'):
+                        parts = line.split()
+                        if len(parts) >= 2: rx_now = parts[1]
+                        in_current_hw = False
+                
+                iface_data['rx_ring'] = "UNKNOWN"
+                if not (rx_now == '?' and rx_max == '?'):
+                    iface_data['rx_ring'] = f"{rx_now}/{rx_max}"
+
+                # 4. Errors from `ethtool -S <iface>`
                 content_s = self._read_file([f'sos_commands/networking/ethtool_-S_{iface_name}'])
                 errors = {}
+                error_pattern = re.compile(r'(drop|err|fail|fifo|over|crc|coll|miss|buf|lost|pause)', re.IGNORECASE)
                 for line in content_s.split('\n'):
-                    match = re.search(r'\s*(\w+.*):\s*(\d+)', line)
-                    if match and int(match.group(2)) > 0:
-                        errors[match.group(1).strip()] = match.group(2)
+                    if error_pattern.search(line):
+                        match = re.search(r'\s*([^:]+):\s*([1-9]\d*)', line)
+                        if match:
+                            key, value = match.groups()
+                            if not re.search(r'(fdir_|veb\.)', key, re.IGNORECASE):
+                                errors[key.strip()] = value
                 if errors:
-                    details['ethtool'][iface_name]['errors'] = errors
+                    iface_data['errors'] = errors
+                
+                details['ethtool'][iface_name] = iface_data
         
         return details
 
@@ -836,6 +922,7 @@ class AIAnalyzer:
             "process_stats_summary": {
                 "total": sosreport_data.get("process_stats", {}).get("total"),
                 "zombie_count": len(sosreport_data.get("process_stats", {}).get("zombie", [])),
+                "uninterruptible_count": len(sosreport_data.get("process_stats", {}).get("uninterruptible", []))
             },
             "recent_log_warnings_and_errors": log_summary
         }
@@ -1560,18 +1647,38 @@ class AIAnalyzer:
         
         def create_ethtool_rows(ethtool_data):
             rows = ""
-            if not ethtool_data: return "<tr><td colspan='6' style='text-align:center;'>데이터 없음</td></tr>"
-            for iface, data in ethtool_data.items():
+            if not ethtool_data:
+                return "<tr><td colspan='6' style='text-align:center;'>데이터 없음</td></tr>"
+
+            for iface, data in sorted(ethtool_data.items()):
+                link_status = data.get('link_status', 'UNKNOWN').upper()
+                link_details = html.escape(data.get('link_details', ''))
+
+                status_html = ""
+                if link_status == 'UP':
+                    status_html = f'<span style="color: green; font-weight: bold;">{link_status}</span> {link_details}'
+                elif link_status == 'DOWN':
+                    status_html = f'<span style="color: grey;">{link_status}</span> {link_details}'
+                else:
+                    status_html = f'<span style="color: orange;">{link_status}</span> {link_details}'
+
                 errors_html = "없음"
                 if 'errors' in data and data['errors']:
-                    errors_html = "<br>".join([f"{k}: {v}" for k, v in data['errors'].items()])
+                    errors_list = [f"{k}: {v}" for k, v in data['errors'].items()]
+                    if len(errors_list) > 3:
+                        visible_errors = "<br>".join(html.escape(e) for e in errors_list[:3])
+                        hidden_errors = html.escape("\n".join(errors_list[3:]))
+                        errors_html = f'{visible_errors}<br><div class="tooltip">...외 {len(errors_list)-3}개<span class="tooltiptext">{hidden_errors}</span></div>'
+                    else:
+                        errors_html = "<br>".join(html.escape(e) for e in errors_list)
+
                 rows += f"""
                 <tr>
                     <td>{html.escape(iface)}</td>
-                    <td>{html.escape(data.get('speed', 'N/A'))}</td>
-                    <td>{html.escape(data.get('link', 'N/A'))}</td>
-                    <td>{html.escape(data.get('driver', 'N/A'))}</td>
-                    <td>{html.escape(data.get('firmware', 'N/A'))}</td>
+                    <td>{html.escape(data.get('pci_bus', 'N/A'))}</td>
+                    <td>{status_html}</td>
+                    <td>rx ring {html.escape(data.get('rx_ring', 'N/A'))}</td>
+                    <td>{html.escape(data.get('driver_info', 'N/A'))}</td>
                     <td>{errors_html}</td>
                 </tr>
                 """
@@ -1608,18 +1715,32 @@ class AIAnalyzer:
                 </tr>
                 """
             return rows
-
-        def create_process_rows(process_list, title):
+        
+        def create_process_table_rows(process_list, empty_message, include_mem=False):
+            if not process_list:
+                return f"<tr><td colspan='11' style='text-align:center;'>{empty_message}</td></tr>"
             rows = ""
-            if not process_list: return f"<tr><td colspan='4' style='text-align:center;'>{title} 없음</td></tr>"
             for p in process_list:
+                command = html.escape(p.get('command', ''))
+                # 긴 Command 잘라내기
+                command_short = command[:100] + '...' if len(command) > 100 else command
+                
+                mem_cols = ''
+                if include_mem:
+                    mem_cols = f"""
+                        <td>{html.escape(str(p.get('mem%', '')))}</td>
+                        <td>{html.escape(p.get('rss_formatted', 'N/A'))}</td>
+                    """
+
                 rows += f"""
-                <tr>
-                    <td>{html.escape(str(p.get('pid', '')))}</td>
-                    <td>{html.escape(p.get('user', ''))}</td>
-                    <td>{html.escape(str(p.get('cpu%', '')))}%</td>
-                    <td>{html.escape(p.get('command', ''))}</td>
-                </tr>
+                    <tr>
+                        <td>{html.escape(p.get('user', ''))}</td>
+                        <td>{html.escape(p.get('pid', ''))}</td>
+                        <td>{html.escape(str(p.get('cpu%', '')))}</td>
+                        {mem_cols}
+                        <td>{html.escape(p.get('stat', ''))}</td>
+                        <td class="tooltip">{command_short}<span class="tooltiptext">{command}</span></td>
+                    </tr>
                 """
             return rows
 
@@ -1696,16 +1817,17 @@ class AIAnalyzer:
         .graph-container {{ margin-bottom: 20px; padding: 15px; border: 1px solid #e0e0e0; border-radius: 5px; background-color: #fafafa; }}
         .graph-container h3 {{ text-align: center; margin-top: 0; color: #333; }}
         .graph-container img {{ width: 100%; max-width: 900px; display: block; margin: auto; border-radius: 4px; }}
-        .data-table {{ width: 100%; border-collapse: collapse; margin-bottom: 20px; font-size: 14px; }}
+        .data-table {{ width: 100%; border-collapse: collapse; margin-bottom: 20px; font-size: 14px; table-layout: fixed; }}
         .data-table th, .data-table td {{ border: 1px solid #dee2e6; padding: 12px; text-align: left; word-wrap: break-word; }}
         .data-table thead th {{ background-color: #f8f9fa; color: #495057; font-weight: 600; }}
-        .fixed-layout {{ table-layout: fixed; }}
         .summary-table th:nth-of-type(1) {{ width: 20%; }}
         .network-table th:nth-of-type(1) {{ width: 15%; }} .network-table th:nth-of-type(2) {{ width: 10%; }} .network-table th:nth-of-type(3) {{ width: 20%; }} .network-table th:nth-of-type(4) {{ width: 8%; }} .network-table th:nth-of-type(5) {{ width: 10%; }}
         .storage-table th:nth-of-type(1) {{ width: 30%; }}
         .recommendations-table th:nth-of-type(1) {{ width: 10%; }} .recommendations-table th:nth-of-type(2) {{ width: 15%; }} .recommendations-table th:nth-of-type(3) {{ width: 35%; }}
         .security-table th:nth-of-type(1) {{ width: 18%; }} .security-table th:nth-of-type(2) {{ width: 8%; }} .security-table th:nth-of-type(3) {{ width: 10%; }}
         .security-table td:nth-of-type(2), .security-table td:nth-of-type(3) {{ text-align: center; }}
+        .ethtool-table th:nth-of-type(1) {{ width: 8%; }} .ethtool-table th:nth-of-type(2) {{ width: 15%; }} .ethtool-table th:nth-of-type(3) {{ width: 25%; }} .ethtool-table th:nth-of-type(4) {{ width: 12%; }} .ethtool-table th:nth-of-type(5) {{ width: 25%; }}
+        .process-table th:nth-child(1) {{width: 12%;}} .process-table th:nth-child(2) {{width: 8%;}} .process-table th:nth-child(3) {{width: 8%;}} .process-table th:nth-child(4) {{width: 8%;}}
         .ai-status {{ font-size: 1.2em; font-weight: bold; color: {status_color}; }}
         footer {{ text-align: center; padding: 15px; font-size: 12px; color: #888; background-color: #f4f7f9; }}
         .tooltip {{ position: relative; display: inline-block; cursor: pointer; }}
@@ -1722,7 +1844,7 @@ class AIAnalyzer:
         <div class="content">
             <div class="section">
                 <h2>ℹ️ 시스템 요약</h2>
-                <table class="data-table summary-table fixed-layout">
+                <table class="data-table summary-table">
                     <tbody>
                         <tr><th>Hostname</th><td>{html.escape(system_info.get('hostname', 'N/A'))}</td></tr>
                         <tr><th>OS Version</th><td>{html.escape(system_info.get('os_version', 'N/A'))}</td></tr>
@@ -1739,7 +1861,7 @@ class AIAnalyzer:
             <div class="section">
                 <h2>🌐 네트워크 정보</h2>
                 <h3>IP4 상세 정보</h3>
-                <table class="data-table network-table fixed-layout">
+                <table class="data-table network-table">
                     <thead><tr><th>Interface</th><th>Master IF</th><th>MAC Address</th><th>MTU</th><th>State</th><th>IPv4 Address</th></tr></thead>
                     <tbody>{ip4_details_rows}</tbody>
                 </table>
@@ -1749,9 +1871,9 @@ class AIAnalyzer:
                     <tbody>{ "".join(f"<tr><td>{html.escape(r.get('destination', ''))}</td><td>{html.escape(r.get('gateway', ''))}</td><td>{html.escape(r.get('device', ''))}</td><td>{html.escape(r.get('source', ''))}</td></tr>" for r in system_info.get('routing_table', [])) }</tbody>
                 </table>
                 <h3>ETHTOOL 상태</h3>
-                <table class="data-table">
-                    <thead><tr><th>Interface</th><th>Speed</th><th>Link Detected</th><th>Driver</th><th>Firmware Version</th><th>Errors</th></tr></thead>
-                    <tbody>{ create_ethtool_rows(network_details.get('ethtool', {})) }</tbody>
+                <table class="data-table ethtool-table">
+                    <thead><tr><th>Interface</th><th>PCI Bus</th><th>Link Status</th><th>RX Ring</th><th>Driver / Firmware</th><th>Errors</th></tr></thead>
+                    <tbody>{ create_ethtool_rows(network_details.get('ethtool', {{}})) }</tbody>
                 </table>
                  <h3>NETDEV 통계</h3>
                 <table class="data-table">
@@ -1776,19 +1898,29 @@ class AIAnalyzer:
                     <tbody>{"".join(f"<tr><td>{html.escape(u.get('user', ''))}</td><td>{html.escape(u.get('cpu%', ''))}</td><td>{html.escape(u.get('mem%', ''))}</td><td>{html.escape(u.get('rss', ''))}</td></tr>" for u in process_stats.get('by_user', []))}</tbody>
                 </table>
                 <h3>Top 5 CPU 사용 프로세스</h3>
-                <table class="data-table">
-                     <thead><tr><th>PID</th><th>User</th><th>CPU%</th><th>Command</th></tr></thead>
-                    <tbody>{create_process_rows(process_stats.get('top_cpu', []), "CPU 사용량 높은 프로세스")}</tbody>
+                <table class="data-table process-table">
+                     <thead><tr><th>User</th><th>PID</th><th>CPU%</th><th>STAT</th><th>Command</th></tr></thead>
+                    <tbody>{create_process_table_rows(process_stats.get('top_cpu', []), "CPU 사용량 높은 프로세스가 없습니다.")}</tbody>
                 </table>
                  <h3>Top 5 메모리 사용 프로세스</h3>
-                <table class="data-table">
-                    <thead><tr><th>PID</th><th>User</th><th>MEM%</th><th>Command</th></tr></thead>
-                    <tbody>{create_process_rows(process_stats.get('top_mem', []), "메모리 사용량 높은 프로세스")}</tbody>
+                <table class="data-table process-table">
+                    <thead><tr><th>User</th><th>PID</th><th>CPU%</th><th>MEM%</th><th>RSS</th><th>STAT</th><th>Command</th></tr></thead>
+                    <tbody>{create_process_table_rows(process_stats.get('top_mem', []), "메모리 사용량 높은 프로세스가 없습니다.", include_mem=True)}</tbody>
+                </table>
+                <h3>Uninterruptible Sleep Processes ({len(process_stats.get('uninterruptible', []))}개)</h3>
+                <table class="data-table process-table">
+                    <thead><tr><th>User</th><th>PID</th><th>CPU%</th><th>MEM%</th><th>RSS</th><th>STAT</th><th>Command</th></tr></thead>
+                    <tbody>{create_process_table_rows(process_stats.get('uninterruptible', []), "Uninterruptible Sleep 상태의 프로세스가 없습니다.", include_mem=True)}</tbody>
+                </table>
+                <h3>Zombie Processes ({len(process_stats.get('zombie', []))}개)</h3>
+                <table class="data-table process-table">
+                    <thead><tr><th>User</th><th>PID</th><th>CPU%</th><th>MEM%</th><th>RSS</th><th>STAT</th><th>Command</th></tr></thead>
+                    <tbody>{create_process_table_rows(process_stats.get('zombie', []), "Zombie 상태의 프로세스가 없습니다.", include_mem=True)}</tbody>
                 </table>
             </div>
             <div class="section">
                 <h2>💾 스토리지 및 파일 시스템</h2>
-                <table class="data-table storage-table fixed-layout">
+                <table class="data-table storage-table">
                     <thead><tr><th>Filesystem</th><th>Size</th><th>Used</th><th>Avail</th><th>Use%</th><th>Mounted on</th></tr></thead>
                     <tbody>{create_storage_rows(storage_info)}</tbody>
                 </table>
@@ -1809,14 +1941,14 @@ class AIAnalyzer:
             </div>
             <div class="section">
                 <h2>💡 AI 분석: 권장사항 ({len(recommendations)}개)</h2>
-                <table class="data-table recommendations-table fixed-layout">
+                <table class="data-table recommendations-table">
                     <thead><tr><th>우선순위</th><th>카테고리</th><th>문제점 💬</th><th>해결 방안</th></tr></thead>
                     <tbody>{create_recommendation_rows(recommendations)}</tbody>
                 </table>
             </div>
             <div class="section">
                 <h2>🤖 AI 종합 분석</h2>
-                <table class="data-table summary-table fixed-layout">
+                <table class="data-table summary-table">
                     <tbody>
                         <tr><th>종합 상태</th><td><span class="ai-status">{status}</span></td></tr>
                         <tr><th>건강도 점수</th><td>{score}/100</td></tr>
@@ -1826,7 +1958,7 @@ class AIAnalyzer:
             </div>
             <div class="section">
                 <h2>🛡️ AI 선정 긴급 보안 위협 (최대 {MAX_FINAL_CVES}개) <span style="font-size: 0.7em; font-weight: normal;">(🔥 Critical, ⚠️ Important)</span></h2>
-                <table class="data-table security-table fixed-layout">
+                <table class="data-table security-table">
                     <thead><tr><th>CVE 식별자</th><th>심각도</th><th>생성일</th><th>위협 및 영향 요약</th></tr></thead>
                     <tbody>{create_security_news_rows(security_news)}</tbody>
                 </table>
@@ -1996,3 +2128,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
