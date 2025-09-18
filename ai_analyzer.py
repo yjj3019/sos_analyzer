@@ -40,6 +40,71 @@ except ImportError:
     matplotlib = None
     plt = None
 
+class DataAnonymizer:
+    """
+    LLM 전송 전 데이터에서 민감 정보(IP, 호스트명, MAC 주소)를 익명화합니다.
+    일관된 익명화를 위해 발견된 값을 매핑하여 관리합니다. (예: 1.2.3.4 -> ANON_IP_1)
+    """
+    def __init__(self):
+        self.ip_map = {}
+        self.hostname_map = {}
+        self.mac_map = {}
+        # 정규식 정의
+        self.fqdn_regex = re.compile(r'\b(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,6}\b')
+        self.ipv4_regex = re.compile(r'\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b')
+        self.mac_regex = re.compile(r'\b([0-9A-Fa-f]{2}[:-]){5}([0-9A-Fa-f]{2})\b')
+
+    def _anonymize_ip(self, match):
+        ip = match.group(0)
+        if ip.startswith('127.'): return ip # 루프백 주소는 유지
+        if ip not in self.ip_map:
+            self.ip_map[ip] = f"ANON_IP_{len(self.ip_map) + 1}"
+        return self.ip_map[ip]
+
+    def _anonymize_hostname(self, match):
+        hostname = match.group(0)
+        # 일반적인 단어나 파일명과의 혼동을 피하기 위한 예외 처리
+        if hostname.lower() in ['all', 'default', 'localhost']: return hostname
+        if '.' not in hostname or len(hostname.split('.')[-1]) > 6: return hostname
+
+        if hostname not in self.hostname_map:
+            self.hostname_map[hostname] = f"ANON_HOSTNAME_{len(self.hostname_map) + 1}"
+        return self.hostname_map[hostname]
+    
+    def _anonymize_mac(self, match):
+        mac = match.group(0)
+        if mac not in self.mac_map:
+            self.mac_map[mac] = f"ANON_MAC_{len(self.mac_map) + 1}"
+        return self.mac_map[mac]
+
+    def anonymize_text(self, text: str, specific_hostnames: List[str] = []) -> str:
+        """단일 문자열 값에 대해 익명화를 수행합니다."""
+        if not isinstance(text, str):
+            return text
+        
+        # 1. 정확도를 위해 파싱된 특정 호스트명을 먼저 익명화
+        for hostname in specific_hostnames:
+            if hostname and hostname != 'N/A' and hostname.lower() != 'localhost':
+                # 단어 경계(\b)를 사용하여 단어의 일부가 바뀌는 것을 방지
+                text = re.sub(r'\b' + re.escape(hostname) + r'\b', self._anonymize_hostname, text, flags=re.IGNORECASE)
+
+        # 2. 정규식을 사용하여 IP, FQDN, MAC 주소 익명화
+        text = self.ipv4_regex.sub(self._anonymize_ip, text)
+        text = self.fqdn_regex.sub(self._anonymize_hostname, text)
+        text = self.mac_regex.sub(self._anonymize_mac, text)
+        return text
+
+    def anonymize_data(self, data: Any, specific_hostnames: List[str] = []) -> Any:
+        """딕셔너리, 리스트 등 복합 데이터 구조를 재귀적으로 탐색하며 익명화를 수행합니다."""
+        if isinstance(data, dict):
+            return {k: self.anonymize_data(v, specific_hostnames) for k, v in data.items()}
+        elif isinstance(data, list):
+            return [self.anonymize_data(item, specific_hostnames) for item in data]
+        elif isinstance(data, str):
+            return self.anonymize_text(data, specific_hostnames)
+        else:
+            return data
+
 class SosreportParser:
     """sosreport 압축 해제 후 디렉토리에서 데이터를 파싱하여 JSON 구조로 만듭니다."""
     def __init__(self, extract_path: str):
@@ -988,8 +1053,8 @@ class AIAnalyzer:
                 else:
                     raise Exception(f"AI 분석 중 최종 오류 발생: {e}")
 
-    def create_analysis_prompt(self, sosreport_data: Dict[str, Any]) -> str:
-        """[추적 분석] 고도화된 AI 분석 프롬프트를 생성합니다."""
+    def create_analysis_prompt(self, sosreport_data: Dict[str, Any], anonymize: bool = True) -> str:
+        """[추적 분석] 고도화된 AI 분석 프롬프트를 생성합니다. 민감 정보 익명화 옵션을 추가합니다."""
         print("AI 분석 프롬프트 생성 중...")
         
         # --- 성능 데이터 요약 ---
@@ -1071,6 +1136,18 @@ class AIAnalyzer:
             "performance_summary": performance_summary,
             "traced_log_events": traced_events # [추적 분석] 새로운 데이터 추가
         }
+
+        if anonymize:
+            print("민감 정보 익명화 작업 수행 중...")
+            anonymizer = DataAnonymizer()
+            # 시스템 정보에서 호스트명을 추출하여 특정 호스트명으로 등록
+            specific_hostnames = []
+            hostname = sosreport_data.get("system_info", {}).get("hostname")
+            if hostname:
+                specific_hostnames.append(hostname)
+            
+            data_to_send = anonymizer.anonymize_data(data_to_send, specific_hostnames)
+            print("✅ 익명화 완료. IP, 호스트명, MAC 주소가 마스킹되었습니다.")
 
         data_str = json.dumps(data_to_send, indent=2, ensure_ascii=False, default=json_serializer)
 
@@ -1418,7 +1495,7 @@ class AIAnalyzer:
                              labels=['User %', 'System %', 'I/O Wait %'], 
                              colors=['#4C72B0', '#DD8452', '#C44E52'], alpha=0.7)
                 
-                ax.set_title('CPU Usage (%)', fontsize=graph_style['title_fontsize'], weight='bold')
+                # ax.set_title('CPU Usage (%)', fontsize=graph_style['title_fontsize'], weight='bold')
                 ax.set_ylabel('Usage (%)', fontsize=graph_style['label_fontsize'])
                 ax.legend(loc='upper left', frameon=True)
                 ax.set_ylim(0, 100)
@@ -1466,7 +1543,7 @@ class AIAnalyzer:
                 for key, values in kb_metrics.items():
                     ax.plot(timestamps, values, label=key, lw=2)
                 
-                ax.set_title('Memory Usage (KB)', fontsize=graph_style['title_fontsize'], weight='bold')
+                # ax.set_title('Memory Usage (KB)', fontsize=graph_style['title_fontsize'], weight='bold')
                 ax.set_ylabel('Kilobytes', fontsize=graph_style['label_fontsize'])
                 ax.legend(loc='upper left', frameon=True, fontsize='small', ncol=2)
                 ax.grid(True)
@@ -1565,7 +1642,7 @@ class AIAnalyzer:
                     ax2.set_ylabel('kB/s', color='tab:red', fontsize=graph_style['label_fontsize'])
                     ax2.tick_params(axis='y', labelcolor='tab:red')
 
-                    ax1.set_title(f'Network Traffic: {iface} (State: {state})', fontsize=graph_style['title_fontsize'], weight='bold')
+                    # ax1.set_title(f'Network Traffic: {iface} (State: {state})', fontsize=graph_style['title_fontsize'], weight='bold')
                     ax1.xaxis.set_major_locator(mticker.MaxNLocator(nbins=10, prune='both'))
                     plt.setp(ax1.get_xticklabels(), rotation=graph_style['tick_rotation'], ha='right')
 
@@ -1618,7 +1695,7 @@ class AIAnalyzer:
                     ax.plot(timestamps, write_kB, color='#C44E52', lw=2, label='Write (kB/s)')
                     ax.fill_between(timestamps, write_kB, color='#C44E52', alpha=graph_style['alpha'])
 
-                    ax.set_title('Disk I/O (kB/s)', fontsize=graph_style['title_fontsize'], weight='bold')
+                    # ax.set_title('Disk I/O (kB/s)', fontsize=graph_style['title_fontsize'], weight='bold')
                     ax.set_ylabel('kB/s', fontsize=graph_style['label_fontsize'])
                     ax.legend(loc='upper left', frameon=True)
                     ax.xaxis.set_major_locator(mticker.MaxNLocator(nbins=10, prune='both'))
@@ -1645,7 +1722,7 @@ class AIAnalyzer:
                 ax.plot(timestamps, ldavg_5, label='Load Avg (5 min)', color='#55A868')
                 ax.plot(timestamps, ldavg_15, label='Load Avg (15 min)', color='#C44E52')
 
-                ax.set_title('System Load Average', fontsize=graph_style['title_fontsize'], weight='bold')
+                # ax.set_title('System Load Average', fontsize=graph_style['title_fontsize'], weight='bold')
                 ax.set_ylabel('Load', fontsize=graph_style['label_fontsize'])
                 ax.legend(loc='upper left', frameon=True)
                 ax.xaxis.set_major_locator(mticker.MaxNLocator(nbins=10, prune='both'))
@@ -1670,7 +1747,7 @@ class AIAnalyzer:
                 ax.plot(timestamps, swpused_pct, label='Swap Used %', color='#9B59B6')
                 ax.fill_between(timestamps, swpused_pct, color='#9B59B6', alpha=0.3)
 
-                ax.set_title('Swap Usage (%)', fontsize=graph_style['title_fontsize'], weight='bold')
+                # ax.set_title('Swap Usage (%)', fontsize=graph_style['title_fontsize'], weight='bold')
                 ax.set_ylabel('Usage (%)', fontsize=graph_style['label_fontsize'])
                 ax.legend(loc='upper left', frameon=True)
                 ax.set_ylim(0, max(100, max(swpused_pct) * 1.1 if swpused_pct else 100)) # Adjust Y-axis limit
@@ -2011,29 +2088,9 @@ class AIAnalyzer:
         }}
         header h1 {{ margin: 0; font-size: 2em; font-weight: 600; }}
         header p {{ margin: 0.5rem 0 0; font-size: 1.1em; opacity: 0.8; }}
-        .dashboard {{
-            display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
-            gap: 1.5rem; margin-bottom: 2rem;
+        .summary-text {{
+             font-size: 1.1em; line-height: 1.7; color: var(--text-color);
         }}
-        .stat-card {{
-            background: var(--card-bg); border-radius: 10px; padding: 1.5rem;
-            box-shadow: var(--box-shadow); border-left: 5px solid var(--primary-color);
-            transition: transform 0.2s ease, box-shadow 0.2s ease;
-        }}
-        .stat-card:hover {{ transform: translateY(-5px); box-shadow: 0 8px 16px rgba(0, 0, 0, 0.1); }}
-        .stat-card h3 {{
-            margin: 0 0 0.5rem; font-size: 1.1em; color: var(--secondary-color);
-            display: flex; align-items: center;
-        }}
-        .stat-card .icon {{ margin-right: 0.75rem; color: var(--primary-color); width: 24px; height: 24px; }}
-        .stat-card .value {{ font-size: 1.8em; font-weight: 600; color: var(--text-color); }}
-        .stat-card .summary-text {{ font-size: 1em; line-height: 1.6; margin-top: 1rem; }}
-        .stat-card.status-good {{ border-left-color: var(--success-color); }}
-        .stat-card.status-good .icon {{ color: var(--success-color); }}
-        .stat-card.status-warn {{ border-left-color: var(--warning-color); }}
-        .stat-card.status-warn .icon {{ color: var(--warning-color); }}
-        .stat-card.status-danger {{ border-left-color: var(--danger-color); }}
-        .stat-card.status-danger .icon {{ color: var(--danger-color); }}
         .report-card {{
             background: var(--card-bg); border-radius: 10px; margin-bottom: 2rem;
             box-shadow: var(--box-shadow); overflow: hidden;
@@ -2064,13 +2121,6 @@ class AIAnalyzer:
         }}
         .graph-container h3 {{ text-align: center; margin-top: 0; font-size: 1.2em; color: var(--secondary-color); }}
         .graph-container img {{ width: 100%; max-width: 100%; display: block; margin: auto; border-radius: 4px; }}
-        .status-badge {{
-            padding: 0.3em 0.8em; border-radius: 1em; font-size: 1em;
-            font-weight: 700; color: white; display: inline-block;
-        }}
-        .status-badge.정상 {{ background-color: var(--success-color); }}
-        .status-badge.주의 {{ background-color: var(--warning-color); }}
-        .status-badge.위험 {{ background-color: var(--danger-color); }}
         .priority-badge {{
             padding: 0.25em 0.6em; border-radius: 5px; font-size: 0.85em;
             font-weight: 600; color: white; text-align: center;
@@ -2100,7 +2150,6 @@ class AIAnalyzer:
             .card-header {{ font-size: 1.2em; }}
             .data-table {{ font-size: 0.85em; }}
             .data-table th, .data-table td {{ padding: 0.6rem; }}
-            .dashboard {{ grid-template-columns: 1fr; }}
         }}
     </style>
 </head>
@@ -2111,41 +2160,13 @@ class AIAnalyzer:
             <p>Hostname: {html.escape(system_info.get('hostname', 'N/A'))} &nbsp;&bull;&nbsp; Report Date: {datetime.now().strftime('%Y-%m-%d')}</p>
         </header>
 
-        <div class="dashboard">
-            <div class="stat-card {status_class}">
-                <h3>{svg_icons['warning']} 종합 상태</h3>
-                <div class="value status-badge {status}">{status}</div>
-            </div>
-            <div class="stat-card">
-                <h3>{svg_icons['health']} 건강도 점수</h3>
-                <div class="value">{score}/100</div>
-            </div>
-            <div class="stat-card" style="grid-column: span 1 / -1;">
-                 <h3>{svg_icons['summary_ai']} AI 종합 분석</h3>
-                 <p class="summary-text">{summary}</p>
-            </div>
-        </div>
+        <!-- ================== NEW LAYOUT START ================== -->
 
         <div class="report-card">
-            <div class="card-header">{svg_icons['info']} 시스템 요약</div>
+            <div class="card-header">{svg_icons['summary_ai']} AI 종합 분석</div>
             <div class="card-body">
-                <table class="data-table summary-table">
-                    <tbody>
-                        <tr><th>OS Version</th><td>{html.escape(system_info.get('os_version', 'N/A'))}</td></tr>
-                        <tr><th>Kernel</th><td>{html.escape(system_info.get('kernel', 'N/A'))}</td></tr>
-                        <tr><th>System Model</th><td>{html.escape(system_info.get('system_model', 'N/A'))}</td></tr>
-                        <tr><th>CPU</th><td>{html.escape(system_info.get('cpu', 'N/A'))}</td></tr>
-                        <tr><th>Memory</th><td>{html.escape(system_info.get('memory', 'N/A'))}</td></tr>
-                        <tr><th>Uptime</th><td>{html.escape(system_info.get('uptime', 'N/A'))}</td></tr>
-                        <tr><th>Last Boot</th><td>{html.escape(system_info.get('last_boot', 'N/A'))}</td></tr>
-                    </tbody>
-                </table>
+                <p class="summary-text">{summary}</p>
             </div>
-        </div>
-
-        <div class="report-card">
-            <div class="card-header">{svg_icons['dashboard']} 성능 분석 요약</div>
-            <div class="card-body">{graph_html}</div>
         </div>
 
         <div class="report-card">
@@ -2172,14 +2193,28 @@ class AIAnalyzer:
             </div>
         </div>
         
+        <!-- ================== ORIGINAL SECTIONS START HERE ================== -->
+
         <div class="report-card">
-            <div class="card-header">{svg_icons['shield']} AI 선정 긴급 보안 위협 (최대 {self.MAX_FINAL_CVES}개)</div>
+            <div class="card-header">{svg_icons['info']} 시스템 요약</div>
             <div class="card-body">
-                <table class="data-table security-table">
-                    <thead><tr><th>CVE 식별자</th><th>심각도</th><th>생성일</th><th>위협 및 영향 요약</th></tr></thead>
-                    <tbody>{create_security_news_rows(security_news)}</tbody>
+                <table class="data-table summary-table">
+                    <tbody>
+                        <tr><th>OS Version</th><td>{html.escape(system_info.get('os_version', 'N/A'))}</td></tr>
+                        <tr><th>Kernel</th><td>{html.escape(system_info.get('kernel', 'N/A'))}</td></tr>
+                        <tr><th>System Model</th><td>{html.escape(system_info.get('system_model', 'N/A'))}</td></tr>
+                        <tr><th>CPU</th><td>{html.escape(system_info.get('cpu', 'N/A'))}</td></tr>
+                        <tr><th>Memory</th><td>{html.escape(system_info.get('memory', 'N/A'))}</td></tr>
+                        <tr><th>Uptime</th><td>{html.escape(system_info.get('uptime', 'N/A'))}</td></tr>
+                        <tr><th>Last Boot</th><td>{html.escape(system_info.get('last_boot', 'N/A'))}</td></tr>
+                    </tbody>
                 </table>
             </div>
+        </div>
+
+        <div class="report-card">
+            <div class="card-header">{svg_icons['dashboard']} 자원 사용 현황</div>
+            <div class="card-body">{graph_html}</div>
         </div>
         
         <div class="report-card">
@@ -2254,6 +2289,16 @@ class AIAnalyzer:
             </div>
         </div>
 
+        <div class="report-card">
+            <div class="card-header">{svg_icons['shield']} AI 선정 긴급 보안 위협 (최대 {self.MAX_FINAL_CVES}개)</div>
+            <div class="card-body">
+                <table class="data-table security-table">
+                    <thead><tr><th>CVE 식별자</th><th>심각도</th><th>생성일</th><th>위협 및 영향 요약</th></tr></thead>
+                    <tbody>{create_security_news_rows(security_news)}</tbody>
+                </table>
+            </div>
+        </div>
+
     </div>
     <footer> AI System Analyzer &nbsp;&bull;&nbsp; Generated at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</footer>
 </body>
@@ -2322,6 +2367,7 @@ def main():
     parser.add_argument('--api-token', help='API 인증 토큰. LLM_API_TOKEN 환경 변수로도 설정 가능')
     parser.add_argument('--output', '-o', default='output', help='결과 저장 디렉토리 (기본값: output)')
     parser.add_argument('--no-html', action='store_true', help='HTML 보고서 생성을 비활성화합니다.')
+    parser.add_argument('--no-anonymize', action='store_true', help='LLM에 전송하기 전 민감 정보(IP, 호스트명 등) 익명화를 비활성화합니다.')
     parser.add_argument('--list-models', action='store_true', help='서버에서 사용 가능한 모델 목록을 조회합니다.')
     parser.add_argument('--test-only', action='store_true', help='LLM 연결 테스트만 수행 (모델 이름 필요)')
     
@@ -2390,7 +2436,7 @@ def main():
             print(f"❌ 전체 추출 데이터 JSON 저장 실패: {e}")
 
 
-        prompt = analyzer.create_analysis_prompt(sos_data)
+        prompt = analyzer.create_analysis_prompt(sos_data, anonymize=not args.no_anonymize)
         result = analyzer.perform_ai_analysis(prompt)
         print("✅ AI 시스템 분석 완료!")
         
