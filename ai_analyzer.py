@@ -5,7 +5,7 @@ sosreport 압축 파일을 입력받아 압축 해제, 데이터 추출, AI 분�
 
 사용법:
     # 기본 사용법 (sosreport 압축 파일을 입력)
-    python3 sos_analyzer.py sosreport-archive.tar.xz --llm-url <URL> --model <MODEL> --api-token <TOKEN>
+    python3 ai_analyzer.py sosreport-archive.tar.xz --llm-url <URL> --model <MODEL> --api-token <TOKEN>
 """
 
 import os
@@ -1360,7 +1360,7 @@ class AIAnalyzer:
 2.  **공격 복잡도(Attack Complexity):** 공격이 쉽고 간단할수록 긴급도가 높습니다.
 3.  **필요 권한(Privileges Required):** 공격에 특별한 권한이 필요 없을수록 위험합니다.
 4.  **영향(Impact):** 시스템 전체를 장악할 수 있는 '코드 실행(Code Execution)'이나 '권한 상승(Privilege Escalation)'으로 이어지는 취약점의 우선순위를 높게 평가합니다.
-5.  **패키지 중요도:** `kernel`, `glibc`, `openssh`, `systemd`와 같은 시스템 핵심 패키지의 취약점은 더 위험합니다.
+5.  **패키지 중요도:** `kernel`, `openssl`, `glibc`, `systemd`, `coreutils`, `openssh`, `sudo`와 같은 시스템 핵심 패키지의 취약점은 더 위험합니다.
 
 [입력 데이터: CVE 후보 목록]
 ```json
