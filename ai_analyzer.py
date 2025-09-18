@@ -992,10 +992,17 @@ class AIAnalyzer:
             print(f"❌ 연결 테스트 중 예외 발생: {e}")
             return False
 
-    def perform_ai_analysis(self, prompt: str, is_news_request: bool = False) -> Any:
+    def perform_ai_analysis(self, prompt: str, is_news_request: bool = False, base_name: Optional[str] = None) -> Any:
         print("AI 분석 시작...")
         max_retries = 3
         wait_time = 2  # Initial wait time in seconds
+
+        llm_log_path = None
+        if is_news_request:
+            log_filename = f"{base_name}_llm_security_news.log" if base_name else "llm_security_news.log"
+            if not base_name:
+                print("⚠️ 경고: base_name이 제공되지 않아 기본 로그 파일명을 사용합니다: llm_security_news.log")
+            llm_log_path = self.output_dir / log_filename
 
         for attempt in range(max_retries):
             try:
@@ -1011,14 +1018,14 @@ class AIAnalyzer:
                 start_time = time.time()
                 print(f"LLM API 호출 중... (시도 {attempt + 1}/{max_retries})")
 
-                if is_news_request and attempt == 0:
-                    llm_log_path = self.output_dir / "llm_security_news.log"
+                if llm_log_path and attempt == 0:
                     with open(llm_log_path, 'a', encoding='utf-8') as f:
-                        f.write("\n\n--- NEW PROMPT FOR SECURITY NEWS ---\n")
+                        f.write(f"\n\n--- NEW PROMPT ({datetime.now()}) ---\n")
                         f.write(prompt)
                         f.write("\n\n--- LLM RESPONSE ---\n")
                     print("\n--- LLM에게 보낸 보안 뉴스 프롬프트 ---")
                     print(prompt[:500] + "...")
+                    print(f"자세한 내용은 {llm_log_path} 파일을 참조하세요.")
                     print("-------------------------------------\n")
 
                 response = self.session.post(self.completion_url, json=payload, timeout=self.timeout)
@@ -1030,7 +1037,7 @@ class AIAnalyzer:
                         raise ValueError(f"API 응답에 'choices' 키가 없거나 비어 있습니다. 응답: {result}")
                     
                     ai_response = result['choices'][0]['message']['content']
-                    if is_news_request:
+                    if llm_log_path:
                         with open(llm_log_path, 'a', encoding='utf-8') as f:
                             f.write(ai_response)
                     return self._parse_ai_response_json_only(ai_response)
@@ -1217,7 +1224,7 @@ class AIAnalyzer:
             print(error_message)
             raise ValueError(error_message)
 
-    def fetch_security_news(self, sos_data: Dict[str, Any]) -> List[Dict[str, str]]:
+    def fetch_security_news(self, sos_data: Dict[str, Any], base_name: str) -> List[Dict[str, str]]:
         """
         ### 변경사항 ###
         LLM을 활용한 2단계 CVE 분석 및 선정 로직을 도입했습니다.
@@ -1383,7 +1390,7 @@ class AIAnalyzer:
 """
             
             print(f"2단계 분석: LLM에게 {len(initial_candidate_cves)}개 CVE의 긴급도 분석 및 상위 {self.MAX_FINAL_CVES}개 선정을 요청합니다.")
-            ranking_result = self.perform_ai_analysis(ranking_prompt, is_news_request=True)
+            ranking_result = self.perform_ai_analysis(ranking_prompt, is_news_request=True, base_name=base_name)
             
             top_cve_ids = []
             if isinstance(ranking_result, dict) and 'most_urgent_cves' in ranking_result:
@@ -1428,7 +1435,7 @@ class AIAnalyzer:
 ```
 """
             print("3단계 분석: 최종 선정된 CVE에 대한 설명 번역을 LLM에 요청합니다.")
-            processed_result = self.perform_ai_analysis(translation_prompt, is_news_request=True)
+            processed_result = self.perform_ai_analysis(translation_prompt, is_news_request=True, base_name=base_name)
 
             final_cves_with_translation = []
             if isinstance(processed_result, dict) and 'processed_cves' in processed_result:
@@ -2467,7 +2474,7 @@ def main():
         print("✅ AI 시스템 분석 완료!")
         
         sos_data['ai_analysis'] = result
-        sos_data['security_news'] = analyzer.fetch_security_news(sos_data)
+        sos_data['security_news'] = analyzer.fetch_security_news(sos_data, base_name)
         graphs = analyzer.create_performance_graphs(sos_data)
         
         results = {}
@@ -2491,3 +2498,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
